@@ -494,8 +494,6 @@ close({shutdown, own_alert}, Socket, Transport = gen_tcp, ConnectionStates, Chec
     %% with the network but we want to maximise the odds that
     %% peer application gets all data sent on the tcp connection.
     close({close, ?DEFAULT_TIMEOUT}, Socket, Transport, ConnectionStates, Check);
-close(downgrade, _,_,_,_) ->
-    ok;
 %% Other
 close(_, Socket, Transport, _,_) -> 
     tls_socket:close(Transport, Socket).
@@ -737,7 +735,7 @@ effective_version(Version, _, _) ->
 assert_buffer_sanity(<<?BYTE(_Type), ?UINT24(Length), Rest/binary>>, 
                      #{max_handshake_size := Max}) when
       Length =< Max ->  
-    case size(Rest) of
+    case byte_size(Rest) of
         N when N < Length ->
             true;
         N when N > Length ->       
@@ -748,7 +746,7 @@ assert_buffer_sanity(<<?BYTE(_Type), ?UINT24(Length), Rest/binary>>,
                              malformed_handshake_data))  
     end;  
 assert_buffer_sanity(Bin, _) ->
-    case size(Bin) of
+    case byte_size(Bin) of
         N when N < 3 ->
             true;
         _ ->       
@@ -767,7 +765,7 @@ handle_alerts([#alert{level = ?WARNING, description = ?CLOSE_NOTIFY} | _Alerts],
               {next_state, connection = StateName, #state{connection_env = CEnv, 
                                                           socket_options = #socket_options{active = false},
                                                           start_or_recv_from = From} = State}) when From == undefined ->
-    {next_state, StateName, State#state{connection_env = CEnv#connection_env{terminated = true}}};
+    {next_state, StateName, State#state{connection_env = CEnv#connection_env{socket_tls_closed = true}}};
 handle_alerts([Alert | Alerts], {next_state, StateName, State}) ->
      handle_alerts(Alerts, ssl_gen_statem:handle_alert(Alert, StateName, State));
 handle_alerts([Alert | Alerts], {next_state, StateName, State, _Actions}) ->
