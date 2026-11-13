@@ -1,7 +1,9 @@
 %%
 %% %CopyrightBegin%
 %%
-%% Copyright Ericsson AB 1997-2021. All Rights Reserved.
+%% SPDX-License-Identifier: Apache-2.0
+%%
+%% Copyright Ericsson AB 1997-2026. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -19,6 +21,10 @@
 %%
 
 -module(inet_db).
+-moduledoc false.
+
+-compile([{nowarn_possibly_unsafe_function, {file, consult, 1}},
+          {nowarn_possibly_unsafe_function, {erlang, binary_to_term, 1}}]).
 
 %% Store info about ip addresses, names, aliases host files resolver
 %% options.
@@ -47,7 +53,7 @@
 -export([set_cache_size/1, set_cache_refresh/1]).
 -export([set_timeout/1, set_retry/1, set_servfail_retry_timeout/1,
          set_inet6/1, set_usevc/1]).
--export([set_edns/1, set_udp_payload_size/1]).
+-export([set_edns/1, set_udp_payload_size/1, set_dnssec_ok/1]).
 -export([set_resolv_conf/1, set_hosts_file/1, get_hosts_file/0]).
 -export([tcp_module/0, set_tcp_module/1]).
 -export([udp_module/0, set_udp_module/1]).
@@ -227,6 +233,8 @@ set_edns(Version) -> res_option(edns, Version).
 
 set_udp_payload_size(Size) -> res_option(udp_payload_size, Size).
 
+set_dnssec_ok(DnssecOk) -> res_option(dnssec_ok, DnssecOk).
+
 set_resolv_conf(Fname) when is_list(Fname) ->
     res_option(resolv_conf, Fname).
 
@@ -278,13 +286,12 @@ add_rc(File) ->
 	Error -> Error
     end.
 
-%% Add an inetrc binary term must be a rc list
+%% Add an inetrc binary term that must be an rc list
 add_rc_bin(Bin) ->
-    case catch binary_to_term(Bin) of
-	List when is_list(List) ->
-	    add_rc_list(List);
-	_ ->
-	    {error, badarg}
+    try binary_to_term(Bin) of
+        List when is_list(List)     -> add_rc_list(List);
+        _                           -> {error, badarg}
+    catch error : _                 -> {error, badarg}
     end.
 
 add_rc_list(List) -> call({add_rc_list, List}).
@@ -308,11 +315,11 @@ translate_lookup([]) -> [].
 valid_lookup() -> [dns, file, yp, nis, nisplus, native].
     
 
-%% Reconstruct an inetrc sturcture from inet_db
+%% Reconstruct an inetrc structure from inet_db
 get_rc() -> 
     get_rc([hosts, domain, nameservers, search, alt_nameservers,
-	    timeout, retry, servfail_retry_timeout, inet6, usevc,
-	    edns, udp_payload_size, resolv_conf, hosts_file,
+	    timeout, retry, servfail_retry_timeout, inet6, usevc, random,
+	    edns, udp_payload_size, dnssec_ok, resolv_conf, hosts_file,
 	    socks5_server,  socks5_port, socks5_methods, socks5_noproxy,
 	    udp, sctp, tcp, host, cache_size, cache_refresh, lookup], []).
 
@@ -353,6 +360,10 @@ get_rc([K | Ks], Ls) ->
                                          res_usevc,
                                          false,
                                          Ks, Ls);
+	random                 -> get_rc(random,
+                                         res_random,
+                                         true,
+                                         Ks, Ls);
 	edns                   -> get_rc(edns,
                                          res_edns,
                                          false,
@@ -360,6 +371,10 @@ get_rc([K | Ks], Ls) ->
 	udp_payload_size       -> get_rc(udp_payload_size,
                                          res_udp_payload_size,
                                          ?DNS_UDP_PAYLOAD_SIZE,
+                                         Ks, Ls);
+	dnssec_ok              -> get_rc(dnssec_ok,
+                                         res_dnssec_ok,
+                                         false,
                                          Ks, Ls);
 	resolv_conf            -> get_rc(resolv_conf,
                                          res_resolv_conf,
@@ -440,18 +455,15 @@ get_rc_hosts([], Ls) ->
 get_rc_hosts([{{_Fam, IP}, Names} | Hosts], Ls) ->
     get_rc_hosts(Hosts, [{host, IP, Names} | Ls]).
 
+%% Some odd features stuffed into this API
+%%
+res_option(next_id) ->
+    generate_next_id();
+res_option(random_port) ->
+    generate_random_port();
 %%
 %% Resolver options
 %%
-res_option(next_id)        ->
-    Cnt = ets:update_counter(inet_db, res_id, 1),
-    case Cnt band 16#ffff of
-	0 ->
-	    ets:update_counter(inet_db, res_id, -Cnt),
-	    0;
-	Id ->
-	    Id
-    end;
 res_option(Option) ->
     case res_optname(Option) of
 	undefined ->
@@ -481,8 +493,10 @@ res_optname(servfail_retry_timeout) -> res_servfail_retry_timeout;
 res_optname(timeout) -> res_timeout;
 res_optname(inet6) -> res_inet6;
 res_optname(usevc) -> res_usevc;
+res_optname(random) -> res_random;
 res_optname(edns) -> res_edns;
 res_optname(udp_payload_size) -> res_udp_payload_size;
+res_optname(dnssec_ok) -> res_dnssec_ok;
 res_optname(resolv_conf) -> res_resolv_conf;
 res_optname(resolv_conf_name) -> res_resolv_conf;
 res_optname(hosts_file) -> res_hosts_file;
@@ -515,8 +529,10 @@ res_check_option(servfail_retry_timeout, T) when is_integer(T), T >= 0 -> true;
 res_check_option(timeout, T) when is_integer(T), T > 0 -> true;
 res_check_option(inet6, Bool) when is_boolean(Bool) -> true;
 res_check_option(usevc, Bool) when is_boolean(Bool) -> true;
+res_check_option(random, Bool) when is_boolean(Bool) -> true;
 res_check_option(edns, V) when V =:= false; V =:= 0 -> true;
 res_check_option(udp_payload_size, S) when is_integer(S), S >= 512 -> true;
+res_check_option(dnssec_ok, D) when is_boolean(D) -> true;
 res_check_option(resolv_conf, "") -> true;
 res_check_option(resolv_conf, F) ->
     res_check_option_absfile(F);
@@ -550,7 +566,6 @@ res_check_ns({{A,B,C,D}, Port})
   when ?ip(A,B,C,D), Port band 65535 =:= Port -> true;
 res_check_ns(_) -> false.
 
-res_check_search("") -> true;
 res_check_search(Dom) -> inet_parse:visible_string(Dom).
 
 socks_option(server)  -> db_get(socks5_server);
@@ -579,8 +594,11 @@ res_update(Option, TagTm) ->
     end.
 
 db_get(Name) ->
-    try ets:lookup_element(inet_db, Name, 2)
-    catch error:badarg -> undefined
+    try
+        ets:lookup_element(inet_db, Name, 2, undefined)
+    catch
+        %% Case where the table does not exist yet.
+        error:badarg -> undefined
     end.
 
 add_rr(RR) ->
@@ -623,15 +641,23 @@ res_cache_answer(RRs) ->
 getbyname(Name, Type) ->
     {EmbeddedDots, TrailingDot} = inet_parse:dots(Name),
     Dot = if TrailingDot -> ""; true -> "." end,
-    if  TrailingDot ->
+    if
+        TrailingDot ->
 	    hostent_by_domain(Name, Type);
 	EmbeddedDots =:= 0 ->
-	    getbysearch(Name, Dot, get_searchlist(), Type, {error,nxdomain});
+            case
+                getbysearch(
+                  Name, Dot, get_searchlist(), Type, {error,nxdomain})
+            of
+                {error,_} ->
+                    hostent_by_domain(Name, Type);
+                Other1 -> Other1
+            end;
 	true ->
 	    case hostent_by_domain(Name, Type) of
 		{error,_}=Error ->
 		    getbysearch(Name, Dot, get_searchlist(), Type, Error);
-		Other -> Other
+		Other2 -> Other2
 	    end
     end.
 
@@ -748,7 +774,7 @@ resolve_cnames(Domain, Type, LookupFun, LcDomain, Aliases, LcAliases) ->
                             %% Repeat with the (more) canonical domain name
                             resolve_cnames(
                               CName, Type, LookupFun, LcCname,
-                              [Domain | Aliases], [LcDomain, LcAliases])
+                              [Domain | Aliases], [LcDomain | LcAliases])
                     end;
                 [_ | _] = _CNames ->
                     ?dbg("resolve_cnames duplicate cnames=~p~n", [_CNames]),
@@ -869,15 +895,16 @@ take_socket_type(MRef) ->
 %% res_search     [Domain]        - list of domains for short names
 %% res_domain     Domain          - local domain for short names
 %% res_recurse    Bool            - recursive query 
-%% res_usevc      Bool            - use tcp only
 %% res_id         Integer         - NS query identifier
 %% res_retry      Integer         - Retry count for UDP query
 %% res_servfail_retry_timeout Integer - Timeout to next query after a failure
 %% res_timeout    Integer         - UDP query timeout before retry
 %% res_inet6      Bool            - address family inet6 for gethostbyname/1
 %% res_usevc      Bool            - use Virtual Circuit (TCP)
+%% res_random     Bool            - use random res_id and port number
 %% res_edns       false|Integer   - false or EDNS version
 %% res_udp_payload_size Integer   - size for EDNS, both query and reply
+%% res_dnssec_ok  Bool            - the DO bit in RFC6891 & RFC3225
 %% res_resolv_conf Filename       - file to watch for resolver config i.e
 %%                                  {res_ns, res_search}
 %% res_hosts_file Filename        - file to watch for hosts config
@@ -899,7 +926,7 @@ take_socket_type(MRef) ->
 %% --------------------
 %% {node_auth,N}  Ls              - List of authentication for node N
 %% {node_crypt,N} Ls              - List of encryption methods for node N
-%% node_auth      Ls              - Default authenication
+%% node_auth      Ls              - Default authentication
 %% node_crypt     Ls              - Default encryption
 %%
 %% Socket type (used for socket monitors)
@@ -948,6 +975,7 @@ reset_db(Db) ->
        {res_lookup, []},
        {res_recurse, true},
        {res_usevc, false},
+       {res_random, true},
        {res_id, 0},
        {res_retry, ?RES_RETRY},
        {res_servfail_retry_timeout, ?RES_SERVFAIL_RETRY_TO},
@@ -955,6 +983,7 @@ reset_db(Db) ->
        {res_inet6, false},
        {res_edns, false},
        {res_udp_payload_size, ?DNS_UDP_PAYLOAD_SIZE},
+       {res_dnssec_ok, false},
        {cache_size, ?CACHE_LIMIT},
        {cache_refresh_interval,?CACHE_REFRESH},
        {socks5_server, ""},
@@ -1010,7 +1039,7 @@ handle_call(Request, From, #state{db=Db}=State) ->
 
 	{add_rrs, RRs} ->
 	    ?dbg("add_rrs: ~p~n", [RRs]),
-	    {reply, do_add_rrs(RRs, Db, State), State};
+	    {reply, do_add_rrs(RRs, Db, State#state.cache), State};
 
 	{del_rr, RR} when is_record(RR, dns_rr) ->
 	    Cache = State#state.cache,
@@ -1044,7 +1073,7 @@ handle_call(Request, From, #state{db=Db}=State) ->
 	    end;
 
 	{set_hostname, Name} ->
-	    case inet_parse:visible_string(Name) of
+	    case inet_parse:visible_string(Name) andalso Name =/= "" of
 		true ->
 		    ets:insert(Db, {hostname, Name}),
 		    {reply, ok, State};
@@ -1205,7 +1234,7 @@ handle_call(Request, From, #state{db=Db}=State) ->
 	    Reply = handle_put_socket_type(State#state.sockets, MRef, Type),
 	    {reply, Reply, State};
 
-	%% Take (in the 'maps' sence of the word) the socket type of
+	%% Take (in the 'maps' sense of the word) the socket type of
 	%% this socket monitor (reference).
 	{take_socket_type, MRef} ->
 	    Reply = handle_take_socket_type(State#state.sockets, MRef),
@@ -1333,8 +1362,8 @@ handle_update_file(
             %% File updated - read content
             ets:insert(Db, {TagInfo, Finfo_1}),
             Bin =
-                case erl_prim_loader:get_file(File) of
-                    {ok, B, _} -> B;
+                case erl_prim_loader:read_file(File) of
+                    {ok, B} -> B;
                     _ -> <<>>
                 end,
             handle_set_file(ParseFun, File, Bin, From, State);
@@ -1636,8 +1665,10 @@ is_res_set(servfail_retry_timeout) -> true;
 is_res_set(retry) -> true;
 is_res_set(inet6) -> true;
 is_res_set(usevc) -> true;
+is_res_set(random) -> true;
 is_res_set(edns) -> true;
 is_res_set(udp_payload_size) -> true;
+is_res_set(dnssec_ok) -> true;
 is_res_set(resolv_conf) -> true;
 is_res_set(hosts_file) -> true;
 is_res_set(_) -> false.
@@ -1654,14 +1685,11 @@ is_reqname(_) -> false.
 %% #dns_rr.cnt is used to store the access time
 %% instead of number of accesses.
 %%
-do_add_rrs(RRs, Db, State) ->
-    CacheDb = State#state.cache,
-    do_add_rrs(RRs, Db, State, CacheDb).
-
-do_add_rrs([], _Db, _State, _CacheDb) ->
+do_add_rrs([], _Db, _CacheDb) ->
     ok;
-do_add_rrs([RR | RRs], Db, State, CacheDb) ->
-    case alloc_entry(Db, CacheDb, #dns_rr.tm) of
+do_add_rrs([RR | RRs], Db, CacheDb) ->
+    Size = ets:lookup_element(Db, cache_size, 2),
+    case alloc_entry(CacheDb, #dns_rr.tm, Size) of
 	true ->
             %% Add to cache
             %%
@@ -1685,7 +1713,7 @@ do_add_rrs([RR | RRs], Db, State, CacheDb) ->
                             DelRR <- DeleteRRs],
                     ok
             end,
-            do_add_rrs(RRs, Db, State, CacheDb);
+            do_add_rrs(RRs, Db, CacheDb);
 	false ->
 	    ok
     end.
@@ -1728,51 +1756,80 @@ lookup_cache_data(LcDomain, Type) ->
             <- match_rr(dns_rr_match(LcDomain, in, Type))].
 
 %% We are simultaneously updating the table from all clients
-%% and the server, so we might get duplicate recource records
+%% and the server, so we might get duplicate resource records
 %% in the table, i.e identical domain, class, type and data.
 %% We embrace that and eliminate duplicates here.
 %%
-%% Look up all matching objects.  The still valid ones
-%% should be returned, and updated with a new cnt time.
-%% All expired ones should be deleted.
+%% Look up all matching objects.
+%% The still valid ones should be returned and updated
+%% in the ETS table with a new access time (#dns_rr.cnt).
+%% All expired ones should be deleted from the ETS table.
 %%
 match_rr(MatchRR) ->
     CacheDb = inet_cache,
     RRs = ets:match_object(CacheDb, MatchRR),
-    match_rr(CacheDb, RRs, times(), #{}, #{}, []).
+    match_rr(CacheDb, RRs, times(), [], []).
 %%
-match_rr(CacheDb, [], _Time, ResultRRs, InsertRRs, DeleteRRs) ->
-    %% We insert first so an RR always is present,
-    %% which may create duplicates
-    _ = [ets:insert(CacheDb, RR) || RR <- maps:values(InsertRRs)],
-    _ = [ets:delete_object(CacheDb, RR) || RR <- DeleteRRs],
-    maps:values(ResultRRs);
-match_rr(CacheDb, [RR | RRs], Time, ResultRRs, InsertRRs, DeleteRRs) ->
+match_rr(CacheDb, [], Time, KeepRRs, DeleteRRs) ->
     %%
-    #dns_rr{ttl = TTL, tm = TM, cnt = Cnt} = RR,
+    %% Keep the first duplicate RR in KeepRRs (reversed)
+    %% that is; the last in RRs
+    ResultRRs = match_rr_dedup(KeepRRs),
+    %%
+    %% We insert before delete so an RR always is present,
+    %% which may create duplicates
+    _ = [ets:insert(CacheDb, RR#dns_rr{cnt = Time})
+         || RR <- ResultRRs,
+            %%
+            %% Insert only if access time changes
+            RR#dns_rr.cnt < Time],
+    _ = [ets:delete_object(CacheDb, RR) || RR <- DeleteRRs],
+    ResultRRs;
+%%
+%% Updating the access time (#dns_rr.cnt) is done by first inserting
+%% an updated RR and then deleting the old, both done above.
+%%
+%% This does not work if the access time for the inserted record
+%% is the same as for the deleted record because then both records
+%% are identical and we end up with the record being deleted
+%% instead of updated.
+%%
+%% When the access time is unchanged, within the time granularity,
+%% the RR should not be updated so it is not put on the delete list
+%% (below) and not re-inserted (above).  Both parts of this
+%% split operation has to use the same condition; RR#dns_rr.cnt < Time,
+%% for this to work.
+%%
+match_rr(CacheDb, [RR | RRs], Time, KeepRRs, DeleteRRs) ->
+    %%
+    #dns_rr{ttl = TTL, tm = TM} = RR,
     if
         TM + TTL < Time ->
-            %% Expired, delete
-            match_rr(
-              CacheDb, RRs, Time,
-              ResultRRs, InsertRRs, [RR | DeleteRRs]);
-        Time =< Cnt ->
-            %% Valid and just updated, return and do not update
-            Key = match_rr_key(RR),
-            match_rr(
-              CacheDb, RRs, Time,
-              ResultRRs#{Key => RR}, InsertRRs, DeleteRRs);
+            %% Expired
+            match_rr(CacheDb, RRs, Time, KeepRRs, [RR | DeleteRRs]);
+        RR#dns_rr.cnt < Time -> % Delete only if access time changes
+            %% Not expired
+            match_rr(CacheDb, RRs, Time, [RR | KeepRRs], [RR | DeleteRRs]);
+        true -> % Cnt == Time since Time is monotonically increasing
+            %% Not expired
+            match_rr(CacheDb, RRs, Time, [RR | KeepRRs], DeleteRRs)
+    end.
+
+%% Remove all duplicate RRs (according to match_rr_key/1)
+%% - keep the first, return reversed list
+%%
+match_rr_dedup(RRs) ->
+    match_rr_dedup(RRs, #{}, []).
+%%
+match_rr_dedup([], _Seen, Acc) ->
+    Acc;
+match_rr_dedup([RR | RRs], Seen, Acc) ->
+    Key = match_rr_key(RR),
+    case erlang:is_map_key(Key, Seen) of
         true ->
-            %% Valid; return and re-insert with updated cnt time.
-            %% The clause above ensures that the cnt field is changed
-            %% which is essential to not accidentally delete
-            %% a record we also insert.
-            Key = match_rr_key(RR),
-            match_rr(
-              CacheDb, RRs, Time,
-              ResultRRs#{Key => RR},
-              InsertRRs#{Key => RR#dns_rr{cnt = Time}},
-              [RR | DeleteRRs])
+            match_rr_dedup(RRs, Seen, Acc);
+        false ->
+            match_rr_dedup(RRs, Seen#{Key => []}, [RR | Acc])
     end.
 
 -compile({inline, [match_rr_key/1]}).
@@ -1848,6 +1905,10 @@ eq_domains([A | As], [B | Bs]) ->
                     false
             end
     end;
+eq_domains([$.], []) ->
+    true;
+eq_domains([], [$.]) ->
+    true;
 eq_domains([], []) ->
     true;
 eq_domains(As, Bs) when is_list(As), is_list(Bs) ->
@@ -1910,8 +1971,7 @@ delete_expired(CacheDb, TM) ->
 %% Returns: true if space for a new entry otherwise false
 %% (true if we have a cache since we always make room for new).
 %% -------------------------------------------------------------------
-alloc_entry(Db, CacheDb, TM) ->
-    Size = ets:lookup_element(Db, cache_size, 2),
+alloc_entry(CacheDb, TM, Size) ->
     if
 	Size =< 0 ->
 	    false;
@@ -1930,11 +1990,11 @@ alloc_entry(Db, CacheDb, TM) ->
 %% This deletion should always give some room since
 %% it removes a percentage of the oldest entries.
 %%
-%% Fetch all cnt times, sort them, calculate a limit
+%% Fetch all access times (#dns_rr.cnt), sort them, calculate a limit
 %% as the earliest of the time 1/3 from the oldest to now,
 %% and the 1/10 oldest entry,.
 %%
-%% Delete all entries with a cnt time older than that,
+%% Delete all entries with an access time (#dns_rr.cnt) older than that,
 %% and all expired (tm + ttl < now).
 %%
 delete_oldest(CacheDb, TM, N) ->
@@ -1960,7 +2020,7 @@ delete_oldest(CacheDb, TM, N) ->
         %% many duplicate times, which is not unlikely
         %% given the second resolution.  Therefore it is
         %% possible that gb_trees and storing the number
-        %% of occurences for a cnt time might be needed,
+        %% of occurrences for a cnt time might be needed,
         %% so insertion gets more complicated and slower,
         %% and we need our own concept of set size.
         %%
@@ -2033,4 +2093,42 @@ handle_take_socket_type(Db, MRef) ->
 	    {ok, Type};
 	[] -> % Already demonitor'ed
 	    error
+    end.
+
+%%----------------------------------------------------------------------
+%% Random DNS Transaction ID and origin port number
+%%----------------------------------------------------------------------
+
+generate_next_id() ->
+    case ets:lookup_element(inet_db, res_random, 2) of
+        true ->
+            case crypto_rand_range(1 bsl 16) of
+                Id when is_integer(Id), 0 =< Id, Id < 1 bsl 16  -> Id;
+                undefined ->
+                    generate_next_id_legacy()
+            end;
+        false ->
+            generate_next_id_legacy()
+    end.
+
+generate_next_id_legacy() ->
+    ets:update_counter(inet_db, res_id, {2, 1, 16#ffff, 0}).
+
+generate_random_port() ->
+    Min   = 1024,
+    Range = (1 bsl 16) - Min,
+    case crypto_rand_range(Range) of
+        V when is_integer(V), 0 =< V, V < Range                 -> Min + V;
+        undefined                                               -> 0
+    end.
+
+crypto_rand_range(Range) when is_integer(Range), 0 < Range ->
+    %% This is how crypto itself checks if it is loaded
+    case application:get_env(crypto, fips_mode) of
+        undefined                                               -> undefined;
+        {ok, Fips} when is_boolean(Fips) ->
+            try crypto:strong_rand_range(Range) of
+                N when is_integer(N, 0, Range-1)                -> N
+            catch error : low_entropy                           -> undefined
+            end
     end.

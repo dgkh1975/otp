@@ -1,8 +1,10 @@
 %%
 %% %CopyrightBegin%
-%% 
-%% Copyright Ericsson AB 1999-2018. All Rights Reserved.
-%% 
+%%
+%% SPDX-License-Identifier: Apache-2.0
+%%
+%% Copyright Ericsson AB 1999-2025. All Rights Reserved.
+%%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
 %% You may obtain a copy of the License at
@@ -14,7 +16,7 @@
 %% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 %% See the License for the specific language governing permissions and
 %% limitations under the License.
-%% 
+%%
 %% %CopyrightEnd%
 %%
 
@@ -29,6 +31,7 @@
 	 increment/1]).
 
 -include_lib("common_test/include/ct.hrl").
+-include_lib("stdlib/include/assert.hrl").
 
 suite() -> [{ct_hooks,[ts_install_cth]}].
 
@@ -217,11 +220,10 @@ badmatch(Config) when is_list(Config) ->
     %% We are satisfied if we can load this module and run it.
     Big = id(32984798729847892498297824872982972978239874),
     Float = id(3.1415927),
-    catch a = Big,
-    catch b = Float,
-    {'EXIT',{{badmatch,3879373498378993387},_}} =
-	   (catch c = 3879373498378993387),
-    {'EXIT',{{badmatch,7.0},_}} = (catch d = 7.0),
+    ?assertError({badmatch,_}, a = Big),
+    ?assertError({badmatch,_}, b = Float),
+    ?assertError({badmatch,3879373498378993387}, c = 3879373498378993387),
+    ?assertError({badmatch,7.0}, d = 7.0),
     case Big of
         Big -> ok
     end,
@@ -231,12 +233,12 @@ badmatch(Config) when is_list(Config) ->
     ok.
 
 case_clause(Config) when is_list(Config) ->
-    {'EXIT',{{case_clause,337.0},_}} = (catch case_clause_float()),
-    {'EXIT',{{try_clause,42.0},_}} = (catch try_case_clause_float()),
-    {'EXIT',{{case_clause,37932749837839747383847398743789348734987},_}} =
-	(catch case_clause_big()),
-    {'EXIT',{{try_clause,977387349872349870423364354398566348},_}} =
-	(catch try_case_clause_big()),
+    ?assertError({case_clause,337.0}, case_clause_float()),
+    ?assertError({try_clause,42.0}, try_case_clause_float()),
+    ?assertError({case_clause,37932749837839747383847398743789348734987},
+                  case_clause_big()),
+    ?assertError({try_clause,977387349872349870423364354398566348},
+                  try_case_clause_big()),
     ok.
 
 case_clause_float() ->
@@ -556,7 +558,7 @@ increment(Config) when is_list(Config) ->
 
     %% Test error handling for the i_increment instruction.
     Bad = id(bad),
-    {'EXIT',{badarith,_}} = (catch Bad + 42),
+    ?assertError(badarith, Bad + 42),
 
     %% Small operands, but a big result.
     Res32 = 1 bsl 27,

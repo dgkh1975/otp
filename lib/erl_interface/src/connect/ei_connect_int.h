@@ -1,7 +1,9 @@
 /*
  * %CopyrightBegin%
  *
- * Copyright Ericsson AB 2001-2020. All Rights Reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Copyright Ericsson AB 2001-2025. All Rights Reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -56,7 +58,7 @@
 #include <sys/utsname.h>  /* for gen_challenge (NEED FIX?) */
 #endif
 
-/* FIXME remove duplicate defintions */
+/* FIXME remove duplicate definitions */
 
 #define DEFBUF_SIZ 100
 
@@ -103,7 +105,12 @@ typedef EI_ULONGLONG DistFlags;
                                 | DFLAG_NEW_FLOATS                \
                                 | DFLAG_MAP_TAG                   \
                                 | DFLAG_EXPORT_PTR_TAG            \
-                                | DFLAG_BIT_BINARIES)
+                                | DFLAG_BIT_BINARIES              \
+                                | DFLAG_HANDSHAKE_23)
+
+/* New mandatory flags for distribution in OTP 26. */
+#define DFLAG_DIST_MANDATORY_26 (DFLAG_V4_NC                      \
+                                 | DFLAG_UNLINK_ID)
 
 /* Mandatory flags for distribution. */
 
@@ -111,13 +118,12 @@ typedef EI_ULONGLONG DistFlags;
  * Mandatory flags for distribution. Keep them in sync with
  * erts/emulator/beam/dist.h.
  */
-#define DFLAG_DIST_MANDATORY DFLAG_DIST_MANDATORY_25
-
+#define DFLAG_DIST_MANDATORY (DFLAG_DIST_MANDATORY_25             \
+                              | DFLAG_DIST_MANDATORY_26)
 
 ei_cnode   *ei_fd_to_cnode(int fd);
 int         ei_distversion(int fd);
 const char* ei_getfdcookie(int fd);
-short       ei_thiscreation(const ei_cnode* ec);
 const char *ei_thiscookie(const ei_cnode* ec);
 
 int ei_do_receive_msg(int fd, int staticbuffer_p, 

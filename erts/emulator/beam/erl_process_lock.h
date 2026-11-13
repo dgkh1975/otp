@@ -1,8 +1,10 @@
 /*
  * %CopyrightBegin%
- * 
- * Copyright Ericsson AB 2007-2018. All Rights Reserved.
- * 
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Copyright Ericsson AB 2007-2025. All Rights Reserved.
+ *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
@@ -14,7 +16,7 @@
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
  * See the License for the specific language governing permissions and
  * limitations under the License.
- * 
+ *
  * %CopyrightEnd%
  */
 
@@ -229,7 +231,7 @@ typedef struct erts_proc_lock_t_ {
 #ifndef ERTS_PROC_LOCK_LOCK_CHECK__
 #define  ERTS_PROC_LOCK_LOCK_CHECK__
 
-/* Lock counter implemetation */
+/* Lock counter implementation */
 
 #ifdef ERTS_ENABLE_LOCK_POSITION
 #define erts_proc_lock__(P,I,L) erts_proc_lock_x__(P,I,L,__FILE__,__LINE__)
@@ -774,15 +776,13 @@ erts_proc_unlock__(Process *p,
         /* What p->lock will look like with all non-waited locks released. */
         ErtsProcLocks want_lflgs = old_lflgs & (wait_locks | ~locks);
 
-        if (want_lflgs != old_lflgs) {
-            ErtsProcLocks new_lflgs =
-                ERTS_PROC_LOCK_FLGS_CMPXCHG_RELB_(&p->lock, want_lflgs, old_lflgs);
+        ErtsProcLocks new_lflgs =
+            ERTS_PROC_LOCK_FLGS_CMPXCHG_RELB_(&p->lock, want_lflgs, old_lflgs);
 
-            if (new_lflgs != old_lflgs) {
-                /* cmpxchg failed, try again. */
-                old_lflgs = new_lflgs;
-                continue;
-            }
+        if (new_lflgs != old_lflgs) {
+            /* cmpxchg failed, try again. */
+            old_lflgs = new_lflgs;
+            continue;
         }
 
         /* We have successfully unlocked every lock with no waiter. */
@@ -991,6 +991,7 @@ erts_proc_lock_wait_until_released(Process *p, ErtsProcLocks locks)
 #if ERTS_PROC_LOCK_OWN_IMPL
 #if !ERTS_PROC_LOCK_ATOMIC_IMPL
         Uint32 was_locked;
+        erts_pix_lock_t *pix_lck = ERTS_PID2PIXLOCK(p->common.id);
 	erts_pix_lock(pix_lck);
 	was_locked =  (ERTS_PROC_LOCK_FLGS_READ_(&p->lock) & locks);
         erts_pix_unlock(pix_lck);

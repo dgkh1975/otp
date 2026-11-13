@@ -1,7 +1,9 @@
 %%
 %% %CopyrightBegin%
 %%
-%% Copyright Ericsson AB 2005-2020. All Rights Reserved.
+%% SPDX-License-Identifier: Apache-2.0
+%%
+%% Copyright Ericsson AB 2005-2025. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -22,6 +24,7 @@
 %-define(debug, true).
 
 -include_lib("stdlib/include/erl_compile.hrl").
+-include_lib("stdlib/include/assert.hrl").
 
 -ifdef(debug).
 -define(config(X,Y), foo).
@@ -40,7 +43,7 @@
 -export([app_test/1,
 	 
 	 file/1, syntax/1, compile/1, rules/1, expect/1,
-	 conflicts/1,
+	 conflicts/1, deterministic/1,
 	 
 	 empty/1, prec/1, yeccpre/1, lalr/1, old_yecc/1, 
 	 other_examples/1,
@@ -70,7 +73,7 @@ all() ->
 
 groups() -> 
     [{checks, [],
-      [file, syntax, compile, rules, expect, conflicts]},
+      [file, syntax, compile, rules, expect, conflicts, deterministic]},
      {examples, [],
       [empty, prec, yeccpre, lalr, old_yecc, other_examples]},
      {bugs, [],
@@ -269,7 +272,7 @@ syntax(Config) when is_list(Config) ->
             nt -> t.">>),
     {ok,_,[{_,[{{2,13},yecc,bad_declaration}]}]} =
         yecc:file(Filename, Ret),
-    ?line {ok,_,[{_,[{2,yecc,bad_declaration}]}]} =
+    {ok,_,[{_,[{2,yecc,bad_declaration}]}]} =
         yecc:file(Filename, [{error_location, line} | Ret]),
 
     %% Syntax error found by yeccparser.
@@ -340,13 +343,13 @@ syntax(Config) when is_list(Config) ->
     %% Note: checking the line numbers. Changes when yeccpre.hrl changes.
     fun() ->
             {error,[{_,[{{5,25},_,["syntax error before: ","bad"]}]},
-                    {_,[{{L1,_},_,{undefined_function,{yeccpars2_2_,1}}},
-                        {{L2,_},_,{bad_inline,{yeccpars2_2_,1}}},
-                        {{_,_},_,{undefined_function,{yeccpars2_2_,1}}},
-                        {{_,_},_,{bad_nowarn_unused_function,{yeccpars2_2_,1}}}]}],
+                    {_,[{{L1,_},_,{undefined_function,{yeccpars2_2_,1},_}},
+                        {{L2,_},_,{bad_inline,{yeccpars2_2_,1},_}},
+                        {{_,_},_,{undefined_function,{yeccpars2_2_,1},_}},
+                        {{_,_},_,{bad_nowarn_unused_function,{yeccpars2_2_,1},_}}]}],
              []} = compile:file(Parserfile1, [basic_validation,return]),
-            L1 = 36 + SzYeccPre,
-            L2 = 45 + SzYeccPre
+            ?assertEqual(L1, 38 + SzYeccPre),
+            ?assertEqual(L2, 47 + SzYeccPre)
     end(),
 
     %% Bad macro in action. OTP-7224.
@@ -360,13 +363,13 @@ syntax(Config) when is_list(Config) ->
     %% Note: checking the line numbers. Changes when yeccpre.hrl changes.
     fun() ->
             {error,[{_,[{{5,24},_,{undefined,'F',1}}]},
-                    {_,[{{L1,_},_,{undefined_function,{yeccpars2_2_,1}}},
-                        {{L2,_},_,{bad_inline,{yeccpars2_2_,1}}},
-                        {{_,_},_,{undefined_function,{yeccpars2_2_,1}}},
-                        {{_,_},_,{bad_nowarn_unused_function,{yeccpars2_2_,1}}}]}],
+                    {_,[{{L1,_},_,{undefined_function,{yeccpars2_2_,1},_}},
+                        {{L2,_},_,{bad_inline,{yeccpars2_2_,1},_}},
+                        {{_,_},_,{undefined_function,{yeccpars2_2_,1},_}},
+                        {{_,_},_,{bad_nowarn_unused_function,{yeccpars2_2_,1},_}}]}],
              []} = compile:file(Parserfile1, [basic_validation,return]),
-            L1 = 36 + SzYeccPre,
-            L2 = 45 + SzYeccPre
+            ?assertEqual(L1, 38 + SzYeccPre),
+            ?assertEqual(L2, 47 + SzYeccPre)
     end(),
 
     %% Check line numbers. OTP-7224.
@@ -926,6 +929,43 @@ conflicts(Config) when is_list(Config) ->
     file:delete(Filename),
     ok.
 
+deterministic(doc) ->
+    "Check yecc respects the +deterministic flag.";
+deterministic(suite) -> [];
+deterministic(Config) when is_list(Config) ->
+    Dir = ?privdir,
+    Filename = filename:join(Dir, "file.yrl"),
+    Parserfile = filename:join(Dir, "file.erl"),
+    ok = file:write_file(Filename,
+                               <<"Nonterminals nt.
+                                  Terminals t.
+                                  Rootsymbol nt.
+                                  nt -> t.">>),
+
+    %% Generated yecc parsers need to include the yeccpre.hrl
+    %% header file, so we'll get a -file attribute corresponding
+    %% to that include. In deterministic mode, that include should
+    %% only use the basename, "yeccpre.hrl", but otherwise, it should
+    %% contain the full path.
+
+    %% Matches when OTP is not installed (e.g. /lib/parsetools/include/yeccpre.hrl)
+    %% and when it is (e.g. /lib/parsetools-2.3.2/include/yeccpre.hrl)
+    AbsolutePathSuffix = "/lib/parsetools.*/include/yeccpre\.hrl",
+
+    ok = yecc:compile(Filename, Parserfile, #options{specific=[deterministic]}),
+    {ok, FormsDet} = epp:parse_file(Parserfile,[]),
+    ?assertMatch(false, search_for_file_attr(AbsolutePathSuffix, FormsDet)),
+    ?assertMatch({value, _}, search_for_file_attr("yeccpre\.hrl", FormsDet)),
+    file:delete(Parserfile),
+
+    ok = yecc:compile(Filename, Parserfile, #options{}),
+    {ok, Forms} = epp:parse_file(Parserfile,[]),
+    ?assertMatch({value, _}, search_for_file_attr(AbsolutePathSuffix, Forms)),
+    file:delete(Parserfile),
+
+    file:delete(Filename),
+    ok.
+
 empty(doc) ->
     "'$empty'.";
 empty(suite) -> [];
@@ -1218,8 +1258,29 @@ yeccpre(Config) when is_list(Config) ->
                 ok.
            ">>,
            default,
+           ok},
+
+          {error_3, <<"
+            Nonterminals statement.
+            Terminals keyword string.
+            Rootsymbol statement.
+
+            statement -> keyword string.
+
+            Erlang code.
+
+            -export([t/0]).
+
+            t() ->
+                %% Never crash in yecctoken_to_string/1 or its helpers,
+                %% even if when tokens are not in the format that erl_scan
+                %% produces.
+                {error, _} = parse([{string, 1, <<\"foo\">>}]),
+                ok.
+           ">>,
+           default,
            ok}],
-       
+
     run(Config, Ts),
     ok.
 
@@ -1632,14 +1693,14 @@ otp_7292(Config) when is_list(Config) ->
             SzYeccPre = yeccpre_size(),
             {error,
                    [{_,[{{5,32},_,["syntax error before: ","bad"]}]},
-                    {_,[{{L1,_},_,{undefined_function,{yeccpars2_2_,1}}},
-                        {{L2,_},_,{bad_inline,{yeccpars2_2_,1}}},
-                        {{_,_},_,{undefined_function,{yeccpars2_2_,1}}},
-                        {{_,_},_,{bad_nowarn_unused_function,{yeccpars2_2_,1}}}]}],
+                    {_,[{{L1,_},_,{undefined_function,{yeccpars2_2_,1},_}},
+                        {{L2,_},_,{bad_inline,{yeccpars2_2_,1},_}},
+                        {{_,_},_,{undefined_function,{yeccpars2_2_,1},_}},
+                        {{_,_},_,{bad_nowarn_unused_function,{yeccpars2_2_,1},_}}]}],
              [{_,[{{16,20},_,{unused_function,{foo,0}}}]}]} =
                 compile:file(Parserfile1, [basic_validation, return]),
-            L1 = 46 + SzYeccPre,
-            L2 = 55 + SzYeccPre
+            ?assertEqual(L1, 48 + SzYeccPre),
+            ?assertEqual(L2, 57 + SzYeccPre)
     end(),
 
     YeccPre = filename:join(Dir, "yeccpre.hrl"),
@@ -1658,8 +1719,8 @@ otp_7292(Config) when is_list(Config) ->
                         {{_,_},_,{bad_nowarn_unused_function,{yeccpars2_2_,1}}}]}],
                    [{_,[{{16,20},_,{unused_function,{foo,0}}}]}]} =
                 compile:file(Parserfile1, [basic_validation, return]),
-            L1 = 45 + SzYeccPre,
-            L2 = 54 + SzYeccPre
+            ?assertEqual(L1, 45 + SzYeccPre),
+            ?assertEqual(L2, 54 + SzYeccPre)
     end(),
 
     file:delete(YeccPre),
@@ -1830,7 +1891,7 @@ otp_7969(Config) when is_list(Config) ->
     ok.
 
 otp_8919(doc) ->
-    "OTP-8919. Improve formating of Yecc error messages.";
+    "OTP-8919. Improve formatting of Yecc error messages.";
 otp_8919(suite) -> [];
 otp_8919(Config) when is_list(Config) ->
     A1 = erl_anno:new(1),
@@ -2021,7 +2082,7 @@ otp_11286(doc) ->
     "OTP-11286. A Unicode filename bug; both Leex and Yecc.";
 otp_11286(suite) -> [];
 otp_11286(Config) when is_list(Config) ->
-    Node = start_node(otp_11286, "+fnu"),
+    {ok, Peer, Node} = ?CT_PEER(["+fnu"]),
     Dir = ?privdir,
     UName = [1024] ++ "u",
     UDir = filename:join(Dir, UName),
@@ -2061,7 +2122,7 @@ otp_11286(Config) when is_list(Config) ->
     Opts = [return, warn_unused_vars,{outdir,Dir}],
     {ok,_,_} = rpc:call(Node, compile, file, [ErlFile, Opts]),
 
-    true = test_server:stop_node(Node),
+    peer:stop(Peer),
     ok.
 
 otp_14285(Config) ->
@@ -2193,17 +2254,6 @@ otp_17535(Config) when is_list(Config) ->
     {ok, _, []} = compile:file(ErlFile, [return]),
     ok.
 
-start_node(Name, Args) ->
-    [_,Host] = string:tokens(atom_to_list(node()), "@"),
-    ct:log("Trying to start ~w@~s~n", [Name,Host]),
-    case test_server:start_node(Name, peer, [{args,Args}]) of
-	{error,Reason} ->
-	    ct:fail(Reason);
-	{ok,Node} ->
-	    ct:log("Node ~p started~n", [Node]),
-	    Node
-    end.
-
 yeccpre_size() ->
     yeccpre_size(default_yeccpre()).
 
@@ -2274,3 +2324,13 @@ process_list() ->
 
 safe_second_element({_,Info}) -> Info;
 safe_second_element(Other) -> Other.
+
+search_for_file_attr(PartialFilePathRegex, Forms) ->
+    lists:search(fun
+                   ({attribute, _, file, {FileAttr, _}}) ->
+                      case re:run(FileAttr, PartialFilePathRegex, [unicode]) of
+                        nomatch -> false;
+                        _ -> true
+                      end;
+                   (_) -> false end,
+                 Forms).

@@ -1,7 +1,9 @@
 /*
  * %CopyrightBegin%
  *
- * Copyright Ericsson AB 2010-2020. All Rights Reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Copyright Ericsson AB 2010-2025. All Rights Reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -22,10 +24,17 @@
 #include "algorithms.h"
 #include "cipher.h"
 #include "mac.h"
+#ifdef HAS_3_0_API
+#include "digest.h"
+#include "pkey.h"
+#endif
 
+#ifdef HAS_3_0_API
+#else
 static unsigned int algo_hash_cnt, algo_hash_fips_cnt;
-static ERL_NIF_TERM algo_hash[14];   /* increase when extending the list */
+static ERL_NIF_TERM algo_hash[17];   /* increase when extending the list */
 void init_hash_types(ErlNifEnv* env);
+#endif
 
 static unsigned int algo_pubkey_cnt, algo_pubkey_fips_cnt;
 static ERL_NIF_TERM algo_pubkey[12]; /* increase when extending the list */
@@ -33,8 +42,7 @@ void init_pubkey_types(ErlNifEnv* env);
 
 static ERL_NIF_TERM algo_curve[2][89]; /* increase when extending the list */
 static ErlNifMutex* mtx_init_curve_types;
-void init_curve_types(ErlNifEnv* env);
-int get_curve_cnt(ErlNifEnv* env, int fips);
+static int get_curve_cnt(ErlNifEnv* env, int fips);
 
 static unsigned int algo_rsa_opts_cnt, algo_rsa_opts_fips_cnt;
 static ERL_NIF_TERM algo_rsa_opts[11]; /* increase when extending the list */
@@ -45,17 +53,30 @@ void init_rsa_opts_types(ErlNifEnv* env);
 
 void init_algorithms_types(ErlNifEnv* env)
 {
-    mtx_init_curve_types =  enif_mutex_create("init_curve_types");
+#ifdef HAS_3_0_API
+#else
     init_hash_types(env);
+#endif
     init_pubkey_types(env);
-    init_curve_types(env);
     init_rsa_opts_types(env);
     /* ciphers and macs are initiated statically */
 }
 
-void cleanup_algorithms_types(ErlNifEnv* env)
+
+int create_curve_mutex(void)
 {
-    enif_mutex_destroy(mtx_init_curve_types);
+    if (!mtx_init_curve_types) {
+        mtx_init_curve_types =  enif_mutex_create("init_curve_types");
+    }
+    return !!mtx_init_curve_types;
+}
+
+void destroy_curve_mutex(void)
+{
+    if (mtx_init_curve_types) {
+        enif_mutex_destroy(mtx_init_curve_types);
+        mtx_init_curve_types = NULL;
+    }
 }
 
 /*================================================================
@@ -64,15 +85,18 @@ void cleanup_algorithms_types(ErlNifEnv* env)
 
 ERL_NIF_TERM hash_algorithms(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
 {
+#ifdef HAS_3_0_API
+    return digest_types_as_list(env);
+#else
     unsigned int cnt  =
-#ifdef FIPS_SUPPORT
-        FIPS_mode() ? algo_hash_fips_cnt :
-#endif
-        algo_hash_cnt;
+        FIPS_MODE() ? algo_hash_fips_cnt : algo_hash_cnt;
 
     return enif_make_list_from_array(env, algo_hash, cnt);
+#endif
 }
 
+#ifdef HAS_3_0_API
+#else
 void init_hash_types(ErlNifEnv* env) {
     // Validated algorithms first
     algo_hash_cnt = 0;
@@ -101,6 +125,15 @@ void init_hash_types(ErlNifEnv* env) {
 #ifdef HAVE_SHA3_512
     algo_hash[algo_hash_cnt++] = enif_make_atom(env, "sha3_512");
 #endif
+#ifdef HAVE_SHAKE128
+    algo_hash[algo_hash_cnt++] = enif_make_atom(env, "shake128");
+#endif
+#ifdef HAVE_SHAKE256
+    algo_hash[algo_hash_cnt++] = enif_make_atom(env, "shake256");
+#endif
+#ifdef HAVE_SM3
+    algo_hash[algo_hash_cnt++] = enif_make_atom(env, "sm3");
+#endif
 #ifdef HAVE_BLAKE2
     algo_hash[algo_hash_cnt++] = enif_make_atom(env, "blake2b");
     algo_hash[algo_hash_cnt++] = enif_make_atom(env, "blake2s");
@@ -120,7 +153,7 @@ void init_hash_types(ErlNifEnv* env) {
 
     ASSERT(algo_hash_cnt <= sizeof(algo_hash)/sizeof(ERL_NIF_TERM));
 }
-
+#endif
 
 /*================================================================
   Public key algorithms
@@ -128,13 +161,14 @@ void init_hash_types(ErlNifEnv* env) {
 
 ERL_NIF_TERM pubkey_algorithms(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
 {
-    unsigned int cnt  =
-#ifdef FIPS_SUPPORT
-        FIPS_mode() ? algo_pubkey_fips_cnt :
-#endif
-        algo_pubkey_cnt;
+    const bool fips = FIPS_MODE();
+    unsigned int cnt  = fips ? algo_pubkey_fips_cnt : algo_pubkey_cnt;
+    ERL_NIF_TERM list = enif_make_list_from_array(env, algo_pubkey, cnt);
 
-    return enif_make_list_from_array(env, algo_pubkey, cnt);
+#ifdef HAS_3_0_API
+    list = build_pkey_type_list(env, list, fips);
+#endif
+    return list;
 }
 
 void init_pubkey_types(ErlNifEnv* env) {
@@ -164,8 +198,19 @@ void init_pubkey_types(ErlNifEnv* env) {
     algo_pubkey[algo_pubkey_cnt++] = enif_make_atom(env, "eddh");
 #endif
     algo_pubkey[algo_pubkey_cnt++] = enif_make_atom(env, "srp");
-
     ASSERT(algo_pubkey_cnt <= sizeof(algo_pubkey)/sizeof(ERL_NIF_TERM));
+}
+
+ERL_NIF_TERM kem_algorithms_nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
+{
+#ifdef HAVE_ML_KEM
+    return enif_make_list3(env,
+                           atom_mlkem512,
+                           atom_mlkem768,
+                           atom_mlkem1024);
+#else
+    return enif_make_list(env, 0);
+#endif
 }
 
 
@@ -195,20 +240,18 @@ ERL_NIF_TERM mac_algorithms(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
 
 ERL_NIF_TERM curve_algorithms(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
 {
-    int fips_mode = 0;
-    int algo_curve_cnt = 0;
+    int fips_mode;
+    int algo_curve_cnt;
 
-# ifdef FIPS_SUPPORT
-    if (FIPS_mode()) fips_mode = 1;
-# endif
-
+    fips_mode = FIPS_MODE();
     algo_curve_cnt = get_curve_cnt(env, fips_mode);
+
     return enif_make_list_from_array(env, algo_curve[fips_mode], algo_curve_cnt);
 }
 
-int init_curves(ErlNifEnv* env, int fips);
+static int init_curves(ErlNifEnv* env, int fips);
 #if defined(HAVE_EC)
-int valid_curve(int nid);
+static int valid_curve(int nid);
 #endif
 
 int get_curve_cnt(ErlNifEnv* env, int fips) {
@@ -225,54 +268,20 @@ int get_curve_cnt(ErlNifEnv* env, int fips) {
 
     enif_mutex_lock(mtx_init_curve_types);
     if (1 == fips) {
-        if (algo_curve_fips_cnt >= 0) {
-            return algo_curve_fips_cnt;
+        if (algo_curve_fips_cnt < 0) {
+            algo_curve_fips_cnt = init_curves(env, 1);
         }
-        algo_curve_fips_cnt = init_curves(env, 1);
         cnt = algo_curve_fips_cnt;
     } else {
-        if (algo_curve_cnt >= 0) {
-            return algo_curve_cnt;
+        if (algo_curve_cnt < 0) {
+            algo_curve_cnt = init_curves(env, 0);
         }
-        algo_curve_cnt = init_curves(env, 0);
         cnt = algo_curve_cnt;
     }
     enif_mutex_unlock(mtx_init_curve_types);
 
     return cnt;
 }
-
-void init_curve_types(ErlNifEnv* env) {
-    /* Initialize the curve counters and curve's lists
-       by calling get_curve_cnt
-    */
-#ifdef FIPS_SUPPORT
-    if (FIPS_mode()) {
-        // FIPS enabled
-        get_curve_cnt(env, 1);
-        FIPS_mode_set(0); // disable
-        get_curve_cnt(env, 0);
-        FIPS_mode_set(1); // re-enable
-    } else {
-        // FIPS disabled but available
-        get_curve_cnt(env, 0);
-        FIPS_mode_set(1); // enable
-        get_curve_cnt(env, 1);
-        FIPS_mode_set(0); // re-disable
-    }
-#else
-    // FIPS mode is not available
-    get_curve_cnt(env, 0);
-#endif
-
-# ifdef DEBUG
-    {
-        int curve_cnt = get_curve_cnt(env, 0);
-        ASSERT(curve_cnt <= sizeof(algo_curve[0])/sizeof(ERL_NIF_TERM));
-    }
-# endif 
-}
-
 
 int init_curves(ErlNifEnv* env, int fips) {
 #if defined(HAVE_EC)
@@ -613,15 +622,21 @@ int init_curves(ErlNifEnv* env, int fips) {
 #endif
 
     if (!fips) {
-#ifdef HAVE_EDDSA
+#ifdef HAVE_ED25519
         algo_curve[fips][cnt++] = enif_make_atom(env,"ed25519");
+#endif
+#ifdef HAVE_ED448
         algo_curve[fips][cnt++] = enif_make_atom(env,"ed448");
 #endif
-#ifdef HAVE_EDDH
+#ifdef HAVE_X25519
         algo_curve[fips][cnt++] = enif_make_atom(env,"x25519");
+#endif
+#ifdef HAVE_X448
         algo_curve[fips][cnt++] = enif_make_atom(env,"x448");
 #endif
     }
+
+    ASSERT(cnt <= sizeof(algo_curve[0])/sizeof(ERL_NIF_TERM));
 
     return cnt;
 #else /* if not HAVE_EC */
@@ -695,10 +710,7 @@ int valid_curve(int nid) {
 ERL_NIF_TERM rsa_opts_algorithms(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
 {
     unsigned int cnt  =
-#ifdef FIPS_SUPPORT
-        FIPS_mode() ? algo_rsa_opts_fips_cnt :
-#endif
-        algo_rsa_opts_cnt;
+        FIPS_MODE() ? algo_rsa_opts_fips_cnt : algo_rsa_opts_cnt;
 
     return enif_make_list_from_array(env, algo_rsa_opts, cnt);
 }

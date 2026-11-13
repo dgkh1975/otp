@@ -1,7 +1,9 @@
 %%
 %% %CopyrightBegin%
 %%
-%% Copyright Ericsson AB 1998-2019. All Rights Reserved.
+%% SPDX-License-Identifier: Apache-2.0
+%%
+%% Copyright Ericsson AB 1998-2025. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -160,7 +162,7 @@ test_one(File) ->
 %% Two filled index files.
 two_filled(Conf) when is_list(Conf) ->
     Dir = ?privdir(Conf),
-    File = list_to_atom(join(Dir, "sune.LOG")),
+    File = join(Dir, "sune.LOG"),
     delete_files(File),
     start(),
 

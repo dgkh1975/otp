@@ -1,7 +1,9 @@
 %%
 %% %CopyrightBegin%
 %%
-%% Copyright Ericsson AB 2014-2016. All Rights Reserved.
+%% SPDX-License-Identifier: Apache-2.0
+%%
+%% Copyright Ericsson AB 2014-2025. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -187,7 +189,7 @@ objects(Config) ->
 	  {"{&min 1, Max 10}",3,{syntax_error,'Max'}},
 	  {"{min 1, &max 10}",3,{syntax_error,'&max'}},
 	  {"{min 1, &Max 10}",3,{syntax_error,'&Max'}},
-	  {"{RESERVERD WORD BIT}",3,{syntax_error,'BIT'}},
+	  {"{RESERVED WORD BIT}",3,{syntax_error,'BIT'}},
 	  {"{&min 1",4,{syntax_error,'END'}}
 	 ],
     L = [{Head++S++End,Line,E} || {S,Line,E} <- L0],

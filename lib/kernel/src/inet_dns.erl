@@ -1,7 +1,9 @@
 %%
 %% %CopyrightBegin%
 %%
-%% Copyright Ericsson AB 1997-2021. All Rights Reserved.
+%% SPDX-License-Identifier: Apache-2.0
+%%
+%% Copyright Ericsson AB 1997-2026. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -18,18 +20,28 @@
 %% %CopyrightEnd%
 %%
 -module(inet_dns).
+-moduledoc false.
 
 %% Dns record encode/decode
 %%
 %% RFC 1035: Domain Names - Implementation and Specification
+%% RFC 1995: Incremental Zone Transfer in DNS
+%% RFC 1996: A Mechanism for Prompt Notification of Zone Changes (DNS NOTIFY)
+%% RFC 2136: Dynamic Updates in the Domain Name System (DNS UPDATE)
 %% RFC 2181: Clarifications to the DNS Specification
-%% RFC 2671: Extension Mechanisms for DNS (EDNS0)
 %% RFC 2782: A DNS RR for specifying the location of services (DNS SRV)
 %% RFC 2915: The Naming Authority Pointer (NAPTR) DNS Resource Rec
+%% RFC 5452: Measures for Making DNS More Resilient against Forged Answers
+%% RFC 5936: DNS Zone Transfer Protocol (AXFR)
 %% RFC 6488: DNS Certification Authority Authorization (CAA) Resource Record
+%% RFC 6762: Multicast DNS
+%% RFC 6891: Extension Mechanisms for DNS (EDNS0)
 %% RFC 7553: The Uniform Resource Identifier (URI) DNS Resource Record
+%% RFC 8945: Secret Key Transaction Authentication for DNS (TSIG)
 
--export([decode/1, encode/1]).
+-export([decode/1, decode/2, decode_reply/3,
+         update_id/2, encode/1, encode/2]).
+-export([decode_algname/1, encode_algname/1]).
 
 -import(lists, [reverse/1]).
 
@@ -47,6 +59,7 @@
 	 make_dns_query/0, make_dns_query/1,
 	 make_dns_query/2, make_dns_query/3]).
 -include("inet_dns_record_adts.hrl").
+
 
 %% Function merge of #dns_rr{} and #dns_rr_opt{}
 %%
@@ -111,6 +124,10 @@ lists_member(H, [H|_]) -> true;
 lists_member(H, [_|T]) -> lists_member(H, T).
 
 
+-define(in_range(Low, X, High), ((Low =< (X)) andalso ((X) =< High))).
+-define(is_decimal(X), (?in_range(0, (X), 9))).
+
+
 %% must match a clause in inet_res:query_nss_e?dns
 -define(DECODE_ERROR, formerr).
 
@@ -136,8 +153,10 @@ lists_member(H, [_|T]) -> lists_member(H, T).
            throw(?DECODE_ERROR)
    end).
 
-decode(Buffer) when is_binary(Buffer) ->
-    try do_decode(Buffer) of
+decode(Buffer) -> decode(Buffer, true). % Backwards compatible
+%%
+decode(Buffer, Mdns) when is_binary(Buffer), is_boolean(Mdns) ->
+    try do_decode(Buffer, Mdns) of
 	DnsRec ->
 	    {ok,DnsRec}
     catch
@@ -145,77 +164,150 @@ decode(Buffer) when is_binary(Buffer) ->
 	    {error,Reason}
     end.
 
-do_decode(<<Id:16,
-	   QR:1,Opcode:4,AA:1,TC:1,RD:1,
-	   RA:1,PR:1,_:2,Rcode:4,
-	   QdCount:16,AnCount:16,NsCount:16,ArCount:16,
-	   QdBuf/binary>>=Buffer) ->
-    {AnBuf,QdList,QdTC} = decode_query_section(QdBuf,QdCount,Buffer),
-    {NsBuf,AnList,AnTC} = decode_rr_section(AnBuf,AnCount,Buffer),
-    {ArBuf,NsList,NsTC} = decode_rr_section(NsBuf,NsCount,Buffer),
-    {Rest,ArList,ArTC} = decode_rr_section(ArBuf,ArCount,Buffer),
-    ?MATCH_ELSE_DECODE_ERROR(
-       Rest,
-       <<>>,
-       begin
-           HdrTC = decode_boolean(TC),
-           DnsHdr =
-               #dns_header{id=Id,
-                           qr=decode_boolean(QR),
-                           opcode=decode_opcode(Opcode),
-                           aa=decode_boolean(AA),
-                           tc=HdrTC,
-                           rd=decode_boolean(RD),
-                           ra=decode_boolean(RA),
-                           pr=decode_boolean(PR),
-                           rcode=Rcode},
-           ?MATCH_ELSE_DECODE_ERROR(
-              %% Header marked as truncated, or no section
-              %% marked as truncated.
-              %% The converse; a section marked as truncated,
-              %% but not the header - is a parse error.
-              %%
-              HdrTC or (not (QdTC or AnTC or NsTC or ArTC)),
-              true,
-              begin
-                  #dns_rec{header=DnsHdr,
-                           qdlist=QdList,
-                           anlist=AnList,
-                           nslist=NsList,
-                           arlist=ArList}
-              end)
-       end);
-do_decode(_) ->
-    %% DNS message does not even match header
+decode_reply(Buffer, #dns_rec{} = Q, Mdns)
+  when is_binary(Buffer), is_boolean(Mdns) ->
+    try do_decode_reply(Buffer, Q, Mdns) of
+        DnsReq -> {ok, DnsReq}
+    catch
+        Reason ->
+            {error, Reason}
+    end.
+
+-define(MSG_HDR_SIZE, 12). % Must align with the following pattern
+do_decode(
+  <<Id:16,
+    QR:1,Opcode:4,AA:1,TC:1,RD:1,
+    RA:1,PR:1,_:2,Rcode:4,
+    QdCount:16,AnCount:16,NsCount:16,ArCount:16,
+    QdBuf/binary>> = Buffer, Mdns) ->
+    %%
+    {AnBuf,QdList,QdTC} = decode_query_section(QdBuf,QdCount,Buffer,Mdns),
+    H_TC = decode_boolean(TC),
+    QdTC andalso not H_TC
+        andalso throw(?DECODE_ERROR),
+    DnsHdr =
+        #dns_header{
+           id     = Id,
+           qr     = decode_boolean(QR),
+           opcode = decode_opcode(Opcode),
+           aa     = decode_boolean(AA),
+           tc     = H_TC,
+           rd     = decode_boolean(RD),
+           ra     = decode_boolean(RA),
+           pr     = decode_boolean(PR),
+           rcode  = Rcode},
+    do_decode(
+      Buffer, DnsHdr, QdList, AnBuf, AnCount, NsCount, ArCount, {Opcode,Mdns});
+do_decode(<<_/binary>>, _Mdns) ->
     throw(?DECODE_ERROR).
 
-decode_query_section(Bin, N, Buffer) ->
-    decode_query_section(Bin, N, Buffer, []).
 
-decode_query_section(<<>>=Rest, N, _Buffer, Qs) ->
+do_decode_reply(
+  <<Id:16, _/binary>> = Buffer,
+  #dns_rec{ header = Q_H, qdlist = [Q_RR] },
+  Mdns) ->
+    Id =:= Q_H#dns_header.id orelse throw(badid),
+    do_decode_reply(Buffer, Q_H, Q_RR, Id, Mdns);
+do_decode_reply(<<_/binary>>, _Q, _Mdns) ->
+    throw(?DECODE_ERROR).
+
+do_decode_reply(
+  <<_:16,
+    QR:1,Opcode:4,AA:1,TC:1,RD:1,
+    RA:1,PR:1,_:2,Rcode:4,
+    QdCount:16,AnCount:16,NsCount:16,ArCount:16,
+    QdBuf/binary>> = Buffer,
+  Q_H, Q_RR, Id, Mdns) ->
+    %%
+    H_QR = decode_boolean(QR),
+    H_QR orelse throw(unknown),
+    H_Opcode = decode_opcode(Opcode),
+    H_Opcode =:= Q_H#dns_header.opcode
+        orelse throw(unknown),
+    H_RD = decode_boolean(RD),
+    H_RD andalso not Q_H#dns_header.rd andalso throw(unknown),
+    %%
+    QdCount == 1
+        orelse throw(noquery),
+    {AnBuf, RRs, QdTC} = decode_query_section(QdBuf, QdCount, Buffer, Mdns),
+    case RRs of
+        [RR] ->
+            RR#dns_query.class    =:= Q_RR#dns_query.class andalso
+                RR#dns_query.type =:= Q_RR#dns_query.type  andalso
+                inet_db:eq_domains(RR#dns_query.domain, Q_RR#dns_query.domain)
+                orelse throw(noquery),
+            H_TC = decode_boolean(TC),
+            QdTC andalso not H_TC
+                andalso throw(?DECODE_ERROR),
+            DnsHdr =
+                #dns_header{
+                   id     = Id,
+                   qr     = H_QR,
+                   opcode = H_Opcode,
+                   aa     = decode_boolean(AA),
+                   tc     = H_TC,
+                   rd     = H_RD,
+                   ra     = decode_boolean(RA),
+                   pr     = decode_boolean(PR),
+                   rcode  = Rcode},
+            do_decode(
+              Buffer, DnsHdr, [RR], AnBuf, AnCount, NsCount, ArCount,
+              {Opcode,Mdns});
+        _ ->
+            throw(?DECODE_ERROR)
+    end;
+do_decode_reply(<<_/binary>>, _Q_H, _Q_RR, _Id, _Mdns) ->
+    throw(unknown).
+
+do_decode(Buffer, DnsHdr, QdList, AnBuf, AnCount, NsCount, ArCount, Opts) ->
+    {NsBuf,AnList,AnTC} =
+        decode_rr_section(AnBuf, AnCount, Buffer, Opts),
+    {ArBuf,NsList,NsTC} =
+        decode_rr_section(NsBuf, NsCount, Buffer, Opts),
+    {Rest,ArList,ArTC} =
+        decode_rr_section(ArBuf, ArCount, Buffer, Opts),
+    Rest =:= <<>>
+        orelse throw(?DECODE_ERROR),
+    ((AnTC orelse NsTC orelse ArTC) andalso not DnsHdr#dns_header.tc)
+        andalso throw(?DECODE_ERROR),
+    #dns_rec{
+       header = DnsHdr,
+       qdlist = QdList,
+       anlist = AnList,
+       nslist = NsList,
+       arlist = ArList}.
+
+
+decode_query_section(Bin, N, Buffer, Mdns) ->
+    decode_query_section(Bin, N, Buffer, Mdns, []).
+
+decode_query_section(<<>>=Rest, N, _Buffer, _Mdns, Qs) ->
     {Rest,reverse(Qs),N =/= 0};
-decode_query_section(Rest, 0, _Buffer, Qs) ->
+decode_query_section(Rest, 0, _Buffer, _Mdns, Qs) ->
     {Rest,reverse(Qs),false};
-decode_query_section(Bin, N, Buffer, Qs) ->
+decode_query_section(Bin, N, Buffer, Mdns, Qs) ->
     ?MATCH_ELSE_DECODE_ERROR(
        decode_name(Bin, Buffer),
-       {<<Type:16,Class:16,Rest/binary>>,Name},
+       {<<T:16,C:16,Rest/binary>>,Name},
        begin
-	    DnsQuery =
-		#dns_query{domain=Name,
-			   type=decode_type(Type),
-			   class=decode_class(Class)},
-	    decode_query_section(Rest, N-1, Buffer, [DnsQuery|Qs])
+           {Class,UnicastResponse} = decode_class(C, Mdns),
+           DnsQuery =
+               #dns_query{
+                  domain           = Name,
+                  type             = decode_type(T),
+                  class            = Class,
+                  unicast_response = UnicastResponse},
+           decode_query_section(Rest, N-1, Buffer, Mdns, [DnsQuery|Qs])
        end).
 
-decode_rr_section(Bin, N, Buffer) ->
-    decode_rr_section(Bin, N, Buffer, []).
-
-decode_rr_section(<<>>=Rest, N, _Buffer, RRs) ->
+decode_rr_section(Bin, N, Buffer, Opts) ->
+    decode_rr_section(Bin, N, Buffer, Opts, []).
+%%
+decode_rr_section(<<>>=Rest, N, _Buffer, _Opts, RRs) ->
     {Rest,reverse(RRs),N =/= 0};
-decode_rr_section(Rest, 0, _Buffer, RRs) ->
+decode_rr_section(Rest, 0, _Buffer, _Opts, RRs) ->
     {Rest,reverse(RRs),false};
-decode_rr_section(Bin, N, Buffer, RRs) ->
+decode_rr_section(Bin, N, Buffer, {Opcode,Mdns} = Opts, RRs) ->
     ?MATCH_ELSE_DECODE_ERROR(
        decode_name(Bin, Buffer),
        {<<T:16/unsigned,C:16/unsigned,TTL:4/binary,
@@ -223,48 +315,91 @@ decode_rr_section(Bin, N, Buffer, RRs) ->
         Name},
        begin
            Type = decode_type(T),
-           Class = decode_class(C),
-           Data = decode_data(D, Class, Type, Buffer),
            RR =
                case Type of
-                   opt ->
-                       <<ExtRcode,Version,Z:16>> = TTL,
-                       #dns_rr_opt{domain=Name,
-                                   type=Type,
-                                   udp_payload_size=C,
-                                   ext_rcode=ExtRcode,
-                                   version=Version,
-                                   z=Z,
-                                   data=Data};
+                   ?S_OPT ->
+                       %% RFC 6891: 6.1.1. FORMERR if more than one dns_rr_opt
+                       lists:keymember(dns_rr_opt, 1, RRs) andalso
+                        throw(?DECODE_ERROR),
+                       <<ExtRcode,Version,DO:1,Z:15>> = TTL,
+                       DnssecOk = (DO =/= 0),
+                       #dns_rr_opt{
+                          domain           = Name,
+                          type             = Type,
+                          udp_payload_size = C,
+                          ext_rcode        = ExtRcode,
+                          version          = Version,
+                          z                = Z,
+                          data             = D,
+                          do               = DnssecOk};
+                   ?S_TSIG ->
+                       %% RFC 8945: 5.2. FORMERR if not last
+                       %% RFC 8945: 5.2. FORMERR if more than one dns_rr_tsig
+                       %%                        (...covered by being last)
+                       Rest =/= <<>> andalso throw(?DECODE_ERROR),
+                       {DR,AlgName} = decode_name(D, Buffer),
+                       ?MATCH_ELSE_DECODE_ERROR(
+                          DR,
+                          <<Now:48, Fudge:16, MACSize:16, MAC:MACSize/binary,
+                            OriginalId:16, Error:16,
+                            OtherLen:16, OtherData:OtherLen/binary>>,
+                          #dns_rr_tsig{
+                             domain        = Name,
+                             type          = Type,
+                             offset        = byte_size(Buffer) - byte_size(Bin),
+                             algname       = AlgName,
+                             now           = Now,
+                             fudge         = Fudge,
+                             mac           = MAC,
+                             original_id   = OriginalId,
+                             error         = Error,
+                             other_data    = OtherData});
                    _ ->
+                       {Class,CacheFlush} = decode_class(C, Mdns),
+                       Data = decode_data(D, Class, Type, Buffer, Opcode),
                        <<TimeToLive:32/signed>> = TTL,
-                       #dns_rr{domain=Name,
-                               type=Type,
-                               class=Class,
-                               ttl=if TimeToLive < 0 -> 0;
-                                      true -> TimeToLive end,
-                               data=Data}
+                       #dns_rr{
+                          domain = Name,
+                          type   = Type,
+                          class  = Class,
+                          ttl    = max(0, TimeToLive),
+                          data   = Data,
+                          func   = CacheFlush}
                end,
-           decode_rr_section(Rest, N-1, Buffer, [RR|RRs])
+           decode_rr_section(Rest, N-1, Buffer, Opts, [RR|RRs])
        end).
 
 %%
 %% Encode a user query
 %%
 
-encode(Q) ->
-    QdCount = length(Q#dns_rec.qdlist),
-    AnCount = length(Q#dns_rec.anlist),
-    NsCount = length(Q#dns_rec.nslist),
-    ArCount = length(Q#dns_rec.arlist),
-    B0 = encode_header(Q#dns_rec.header, QdCount, AnCount, NsCount, ArCount),
-    C0 = gb_trees:empty(),
-    {B1,C1} = encode_query_section(B0, C0, Q#dns_rec.qdlist),
-    {B2,C2} = encode_res_section(B1, C1, Q#dns_rec.anlist),
-    {B3,C3} = encode_res_section(B2, C2, Q#dns_rec.nslist),
-    {B,_} = encode_res_section(B3, C3, Q#dns_rec.arlist),
-    B.
+%% Update the ID field
+update_id(<<_:16, EncMsg/binary>>, Id) ->
+    [<<Id:16>>, EncMsg];
+update_id([<<_:16>> | EncMsg], Id) ->
+    [<<Id:16>> | EncMsg].
 
+
+encode(Q) -> encode(Q, true). % Backwards compatible
+%%
+encode(
+  #dns_rec{
+     header = Header = #dns_header{ opcode = Opcode },
+     qdlist = QdList,
+     anlist = AnList,
+     nslist = NsList,
+     arlist = ArList },
+  Mdns) when is_boolean(Mdns) ->
+    B0 = encode_header(
+           Header,
+           length(QdList), length(AnList), length(NsList), length(ArList)),
+    Opts = {Opcode,Mdns},
+    C0 = gb_trees:empty(),
+    {B1,C1} = encode_query_section(B0, Mdns, C0, QdList),
+    {B2,C2} = encode_res_section(B1, Opts, C1, AnList),
+    {B3,C3} = encode_res_section(B2, Opts, C2, NsList),
+    {B,_}   = encode_res_section(B3, Opts, C3, ArList),
+    B.
 
 %% RFC 1035: 4.1.1. Header section format
 %%
@@ -284,43 +419,72 @@ encode_header(#dns_header{id=Id}=H, QdCount, AnCount, NsCount, ArCount) ->
 
 %% RFC 1035: 4.1.2. Question section format
 %%
-encode_query_section(Bin, Comp, []) -> {Bin,Comp};
-encode_query_section(Bin0, Comp0, [#dns_query{domain=DName}=Q | Qs]) ->
-    Type = encode_type(Q#dns_query.type),
-    Class = encode_class(Q#dns_query.class),
+encode_query_section(Bin, _Mdns, Comp, []) -> {Bin,Comp};
+encode_query_section(Bin0, Mdns, Comp0, [#dns_query{domain=DName}=Q | Qs]) ->
+    T = encode_type(Q#dns_query.type),
+    C = encode_class(
+          Q#dns_query.class, Mdns andalso Q#dns_query.unicast_response),
     {Bin,Comp} = encode_name(Bin0, Comp0, byte_size(Bin0), DName),
-    encode_query_section(<<Bin/binary,Type:16,Class:16>>, Comp, Qs).
+    encode_query_section(<<Bin/binary,T:16,C:16>>, Mdns, Comp, Qs).
 
-%% RFC 1035: 4.1.3. Resource record format
-%% RFC 2671: 4.3, 4.4, 4.6 OPT RR format
+%% RFC 1035:  4.1.3.               Resource record format
+%% RFC 6891:  6.1.2, 6.1.3, 6.2.3  Opt RR format
 %%
-encode_res_section(Bin, Comp, []) -> {Bin,Comp};
-encode_res_section(Bin, Comp, [#dns_rr {domain = DName,
-					type = Type,
-					class = Class,
-					ttl = TTL,
-					data = Data} | Rs]) ->
-    encode_res_section_rr(Bin, Comp, Rs,
-			  DName, Type, Class, <<TTL:32/signed>>, Data);
-encode_res_section(Bin, Comp, [#dns_rr_opt {domain = DName,
-					    udp_payload_size = UdpPayloadSize,
-					    ext_rcode = ExtRCode,
-					    version = Version,
-					    z = Z,
-					    data = Data} | Rs]) ->
-    encode_res_section_rr(Bin, Comp, Rs,
-			  DName, ?S_OPT, UdpPayloadSize,
-			  <<ExtRCode,Version,Z:16>>, Data).
+encode_res_section(Bin, _Opts, Comp, []) -> {Bin,Comp};
+encode_res_section(
+  Bin, Opts, Comp,
+  [#dns_rr{
+      domain = DName,
+      type   = Type,
+      class  = Class,
+      func   = CacheFlush,
+      ttl    = TTL,
+      data   = Data} | Rs]) ->
+    encode_res_section_rr(
+      Bin, Opts, Comp, Rs, DName, Type, Class, CacheFlush,
+      <<TTL:32/signed>>, Data);
+encode_res_section(
+  Bin, Opts, Comp,
+  [#dns_rr_opt{
+      domain           = DName,
+      udp_payload_size = UdpPayloadSize,
+      ext_rcode        = ExtRCode,
+      version          = Version,
+      z                = Z,
+      data             = Data,
+      do               = DnssecOk} | Rs]) ->
+    DO = case DnssecOk of true -> 1; false -> 0 end,
+    encode_res_section_rr(
+      Bin, Opts, Comp, Rs, DName, ?S_OPT, UdpPayloadSize, false,
+      <<ExtRCode,Version,DO:1,Z:15>>, Data);
+encode_res_section(
+  Bin, Opts, Comp,
+  [#dns_rr_tsig{
+      domain           = DName,
+      algname          = AlgName,
+      now              = Now,
+      fudge            = Fudge,
+      mac              = MAC,
+      original_id      = OriginalId,
+      error            = Error,
+      other_data       = OtherData}]) ->
+    Data = {AlgName,Now,Fudge,MAC,OriginalId,Error,OtherData},
+    encode_res_section_rr(
+      Bin, Opts, Comp, [], DName, ?S_TSIG, ?S_ANY, false,
+      <<0:32/signed>>, Data).
 
-encode_res_section_rr(Bin0, Comp0, Rs, DName, Type, Class, TTL, Data) ->
+encode_res_section_rr(
+  Bin0, {Opcode,Mdns} = Opts, Comp0, Rs,
+  DName, Type, Class, CacheFlush, TTL, Data) ->
     T = encode_type(Type),
-    C = encode_class(Class),
+    C = encode_class(Class, Mdns andalso CacheFlush),
     {Bin,Comp1} = encode_name(Bin0, Comp0, byte_size(Bin0), DName),
-    {DataBin,Comp} = encode_data(Comp1, byte_size(Bin)+2+2+byte_size(TTL)+2,
-				 Type, Class, Data),
+    Pos = byte_size(Bin)+2+2+byte_size(TTL)+2,
+    {DataBin,Comp} = encode_data(Comp1, Pos, Type, Class, Data, Opcode),
     DataSize = byte_size(DataBin),
-    encode_res_section(<<Bin/binary,T:16,C:16,
-			TTL/binary,DataSize:16,DataBin/binary>>, Comp, Rs).
+    encode_res_section(
+      <<Bin/binary,T:16,C:16,TTL/binary,DataSize:16,DataBin/binary>>,
+      Opts, Comp, Rs).
 
 %%
 %% Resource types
@@ -344,6 +508,7 @@ decode_type(Type) ->
 	?T_MX -> ?S_MX;
 	?T_TXT -> ?S_TXT;
 	?T_AAAA -> ?S_AAAA;
+	?T_LOC -> ?S_LOC;
 	?T_SRV -> ?S_SRV;
 	?T_NAPTR -> ?S_NAPTR;
 	?T_OPT -> ?S_OPT;
@@ -353,7 +518,8 @@ decode_type(Type) ->
 	?T_UID -> ?S_UID;
 	?T_GID -> ?S_GID;
 	?T_UNSPEC -> ?S_UNSPEC;
-	%% Query type values which do not appear in resource records
+	?T_TSIG -> ?S_TSIG;
+	?T_IXFR -> ?S_IXFR;
 	?T_AXFR -> ?S_AXFR;
 	?T_MAILB -> ?S_MAILB;
 	?T_MAILA -> ?S_MAILA;
@@ -385,6 +551,7 @@ encode_type(Type) ->
 	?S_MX -> ?T_MX;
 	?S_TXT -> ?T_TXT;
 	?S_AAAA -> ?T_AAAA;
+	?S_LOC -> ?T_LOC;
 	?S_SRV -> ?T_SRV;
 	?S_NAPTR -> ?T_NAPTR;
 	?S_OPT -> ?T_OPT;
@@ -394,7 +561,8 @@ encode_type(Type) ->
 	?S_UID -> ?T_UID;
 	?S_GID -> ?T_GID;
 	?S_UNSPEC -> ?T_UNSPEC;
-	%% Query type values which do not appear in resource records
+	?S_TSIG -> ?T_TSIG;
+	?S_IXFR -> ?T_IXFR;
 	?S_AXFR -> ?T_AXFR;
 	?S_MAILB -> ?T_MAILB;
 	?S_MAILA -> ?T_MAILA;
@@ -404,25 +572,45 @@ encode_type(Type) ->
 	Type when is_integer(Type) -> Type    %% raw unknown type
     end.
 
+
 %%
-%% Resource clases
+%% Resource classes
 %%
 
-decode_class(Class) ->
-    case Class of
-	?C_IN -> in;
-	?C_CHAOS ->  chaos;
-	?C_HS -> hs;
-	?C_ANY -> any;
-	_ -> Class    %% raw unknown class
+decode_class(C, false) ->
+    {decode_class(C),false};
+decode_class(C0, true) ->
+    FlagBit = 16#8000,
+    C = C0 band (bnot FlagBit),
+    Class = decode_class(C),
+    Flag = (C0 band FlagBit) =/= 0,
+    {Class,Flag}.
+
+decode_class(C) ->
+    case C of
+        ?C_IN    -> in;
+        ?C_CHAOS -> chaos;
+        ?C_HS    -> hs;
+        ?C_NONE  -> none;
+        ?C_ANY   -> any;
+        _ -> C    %% raw unknown class
     end.
 
+
+encode_class(Class, Flag) ->
+    C = encode_class(Class),
+    case Flag of
+        true  -> FlagBit = 16#8000, C bor FlagBit;
+        false -> C
+    end.
+%%
 encode_class(Class) ->
     case Class of
-	in -> ?C_IN;
+	in    -> ?C_IN;
 	chaos -> ?C_CHAOS;
-	hs -> ?C_HS;
-	any -> ?C_ANY;
+	hs    -> ?C_HS;
+	none  -> ?C_NONE;
+	any   -> ?C_ANY;
 	Class when is_integer(Class) -> Class    %% raw unknown class
     end.
 
@@ -431,6 +619,8 @@ decode_opcode(Opcode) ->
 	?QUERY -> 'query';
 	?IQUERY -> iquery;
 	?STATUS -> status;
+	?NOTIFY -> notify;
+	?UPDATE -> update;
 	_ when is_integer(Opcode) -> Opcode %% non-standard opcode
     end.
 
@@ -439,9 +629,11 @@ encode_opcode(Opcode) ->
 	'query' -> ?QUERY;
 	iquery -> ?IQUERY;
 	status -> ?STATUS;
+	notify -> ?NOTIFY;
+	update -> ?UPDATE;
 	_ when is_integer(Opcode) -> Opcode %% non-standard opcode
     end.
-	    
+
 
 encode_boolean(true) -> 1;
 encode_boolean(false) -> 0;
@@ -450,12 +642,19 @@ encode_boolean(B) when is_integer(B) -> B.
 decode_boolean(0) -> false;
 decode_boolean(I) when is_integer(I) -> true.
 
-
+decode_data(Data, Class, Type, Buffer, Opcode) ->
+    if
+        %% RFC 2136: 2.4. Allow length zero data for UPDATE
+        Opcode == ?UPDATE, Data == <<>> ->
+            #dns_rr{}#dns_rr.data;
+        true ->
+            decode_data(Data, Class, Type, Buffer)
+    end.
 %%
 %% Data field -> term() content representation
 %%
 %% Class IN RRs
-decode_data(Data, in, ?S_A,  _)   ->
+decode_data(Data, in, ?S_A,  _) ->
     ?MATCH_ELSE_DECODE_ERROR(Data, <<A,B,C,D>>, {A,B,C,D});
 decode_data(Data, in, ?S_AAAA, _) ->
     ?MATCH_ELSE_DECODE_ERROR(
@@ -467,15 +666,12 @@ decode_data(Data, in, ?S_WKS, _) ->
        Data,
        <<A,B,C,D,Proto,BitMap/binary>>,
        {{A,B,C,D},Proto,BitMap});
-%% OPT pseudo-RR (of no class)
-decode_data(Data, _UdpPayloadSize, ?S_OPT, _) ->
-    Data;
 %%
 decode_data(Data, Class, Type, Buffer) ->
     if
-        is_integer(Class) ->
+        is_integer(Class) -> % Raw class
             Data;
-        is_atom(Class) ->
+        is_atom(Class) -> % Symbolic class, i.e: known
             decode_data(Data, Type, Buffer)
     end.
 %%
@@ -512,6 +708,21 @@ decode_data(Data, ?S_MX, Buffer) ->
        Data,
        <<Prio:16,Dom/binary>>,
        {Prio,decode_domain(Dom, Buffer)});
+decode_data(Data, ?S_LOC, _) ->
+    ?MATCH_ELSE_DECODE_ERROR(
+       Data,
+       <<Version:8, SizeBase:4, SizeExp:4,
+         HorizPreBase:4, HorizPreExp:4, VertPreBase:4, VertPreExp:4,
+         Latitude:32, Longitude:32, Altitude:32>>,
+       ((Version =:= 0) andalso
+        ?is_decimal(SizeBase) andalso ?is_decimal(SizeExp) andalso
+        ?is_decimal(HorizPreBase) andalso ?is_decimal(HorizPreExp) andalso
+        ?is_decimal(VertPreBase) andalso ?is_decimal(VertPreExp)),
+       {{decode_loc_angle(Latitude), decode_loc_angle(Longitude)},
+        decode_loc_altitude(Altitude),
+        decode_loc_size(SizeBase, SizeExp),
+        {decode_loc_size(HorizPreBase, HorizPreExp),
+         decode_loc_size(VertPreBase, VertPreExp)}});
 decode_data(Data, ?S_SRV, Buffer) ->
     ?MATCH_ELSE_DECODE_ERROR(
        Data,
@@ -577,7 +788,11 @@ decode_characters(Data, Encoding) ->
     ?MATCH_ELSE_DECODE_ERROR(
        Data,
        <<Len,Bin:Len/binary,Rest/binary>>,
-       {Rest,unicode:characters_to_list(Bin, Encoding)}).
+       ?MATCH_ELSE_DECODE_ERROR(
+          unicode:characters_to_list(Bin, Encoding),
+          String,
+          is_list(String),
+          {Rest,String})).
 
 %% One domain name only, there must be nothing after
 %%
@@ -587,32 +802,55 @@ decode_domain(Bin, Buffer) ->
 %% Domain name -> {RestBin,Name}
 %%
 decode_name(Bin, Buffer) ->
-    decode_name(Bin, Buffer, [], Bin, 0).
+    decode_name(Bin, Buffer, [], Bin, 0, 0).
 
-%% Tail advances with Rest until the first indirection is followed
-%% then it stays put at that Rest.
-decode_name(_, Buffer, _Labels, _Tail, Cnt) when Cnt > byte_size(Buffer) ->
-    throw(?DECODE_ERROR); %% Insanity bailout - this must be a decode loop
-decode_name(<<0,Rest/binary>>, _Buffer, Labels, Tail, Cnt) ->
-    %% Root domain, we have all labels for the domain name
-    {if Cnt =/= 0 -> Tail; true -> Rest end,
+decode_name(_Bin, _Buffer, _Labels, _Cont, NameLen, _PtrCnt)
+  when NameLen >= 255 ->
+    %% There must also be room for the root label in 255 octets
+    %%
+    %% One might also cap PtrCnt heuristicly at 20..50 but there is no
+    %% support for that in RFC 1035, although almost certainly not a problem,
+    %% and not an uncommon defensive practice.
+    %%
+    %% Now it is possible to craft a message that will have long
+    %% backwards pointer chains causing high, but not catastrophically high,
+    %% decode work.
+    throw(?DECODE_ERROR);
+decode_name(<<0,Rest/binary>>, _Buffer, Labels, Cont, _NameLen, PtrCnt) ->
+    %% Root domain; we have all labels for the domain name
+    {decode_name_rest(Rest, Cont, PtrCnt),
      decode_name_labels(Labels)};
-decode_name(<<0:2,Len:6,Label:Len/binary,Rest/binary>>,
-	     Buffer, Labels, Tail, Cnt) ->
+decode_name(
+  <<0:2,Len:6,Label:Len/binary,Rest/binary>>,
+  Buffer, Labels, Cont, NameLen, PtrCnt) ->
     %% One plain label here
-    decode_name(Rest, Buffer, [Label|Labels],
-		if Cnt =/= 0 -> Tail; true -> Rest end,
-		Cnt);
-decode_name(<<3:2,Ptr:14,Rest/binary>>, Buffer, Labels, Tail, Cnt) ->
-    %% Indirection - reposition in buffer and recurse
+    decode_name(
+      Rest, Buffer, [Label|Labels], decode_name_rest(Rest, Cont, PtrCnt),
+      NameLen + 1 + Len, PtrCnt);
+decode_name(
+  <<3:2,Ptr:14,Rest/binary>>, Buffer, Labels, Cont, NameLen, PtrCnt)
+  when
+      %% Indirection *should* point to lower offset
+      %% (stricter than RFC1035, but commonly used common sense),
+      %% and *must* not point into the header.
+      %%
+      %% This forces a pointer loop to either end when clashing
+      %% into the header, or get content and end on max NameLen.
+      Ptr < byte_size(Buffer) - (byte_size(Rest) + 2),
+      Ptr >= ?MSG_HDR_SIZE ->
+    %% Indirection - reposition in buffer
     ?MATCH_ELSE_DECODE_ERROR(
        Buffer,
        <<_:Ptr/binary,Bin/binary>>,
        decode_name(
-         Bin, Buffer, Labels,
-         if Cnt =/= 0 -> Tail; true -> Rest end,
-         Cnt+2)); % size of indirection pointer
-decode_name(_, _, _, _, _) -> throw(?DECODE_ERROR).
+         Bin, Buffer, Labels, decode_name_rest(Rest, Cont, PtrCnt),
+         NameLen, PtrCnt + 1));
+decode_name(_Bin, _Buffer, _Labels, _Cont, _NameLen, _PtrCnt) ->
+    throw(?DECODE_ERROR).
+
+decode_name_rest(Rest, _Cont, 0)        -> Rest;
+decode_name_rest(_Rest, Cont, _PtrCnt)  -> Cont.
+
 
 %% Reverse list of labels (binaries) -> domain name (string)
 decode_name_labels([]) -> ".";
@@ -651,21 +889,19 @@ decode_name_label(Label, Name, N) ->
 	    erlang:error(badarg, [Label,Name,N])
     end.
 
+encode_data(Comp, Pos, Type, Class, Data, Opcode) ->
+    if
+        Opcode == update, Data == #dns_rr{}#dns_rr.data ->
+            {<<>>,Comp};
+        true ->
+            encode_data(Comp, Pos, Type, Class, Data)
+    end.
 %%
 %% Data field -> {binary(),NewCompressionTable}
 %%
-%% Class IN RRs
-encode_data(Comp, _, ?S_A, in, Addr) ->
-    {A,B,C,D} = Addr,
-    {<<A,B,C,D>>,Comp};
-encode_data(Comp, _, ?S_AAAA, in, Addr) ->
-    {A,B,C,D,E,F,G,H} = Addr,
-    {<<A:16,B:16,C:16,D:16,E:16,F:16,G:16,H:16>>,Comp};
-encode_data(Comp, _, ?S_WKS, in, Data) ->
-    {{A,B,C,D},Proto,BitMap} = Data,
-    BitMapBin = iolist_to_binary(BitMap),
-    {<<A,B,C,D,Proto,BitMapBin/binary>>,Comp};
-%% OPT pseudo-RR (of no class)
+%% OPT pseudo-RR (of no class) - should not take this way;
+%% this must be a #dns_rr{type = ?S_OPT} instead of a #dns_rr_opt{},
+%% so good luck getting in particular Class and TTL right...
 encode_data(Comp, _, ?S_OPT, _UdpPayloadSize, Data) ->
     encode_data(Comp, Data);
 %%
@@ -673,12 +909,22 @@ encode_data(Comp, Pos, Type, Class, Data) ->
     if
         is_integer(Class) ->
             encode_data(Comp, Data);
-        is_atom(Class) ->
+        is_atom(Class) -> % Known Class
             encode_data(Comp, Pos, Type, Data)
     end.
 %%
 %%
 %% Standard RRs (any class)
+encode_data(Comp, _, ?S_A, Addr) ->
+    {A,B,C,D} = Addr,
+    {<<A,B,C,D>>,Comp};
+encode_data(Comp, _, ?S_AAAA, Addr) ->
+    {A,B,C,D,E,F,G,H} = Addr,
+    {<<A:16,B:16,C:16,D:16,E:16,F:16,G:16,H:16>>,Comp};
+encode_data(Comp, _, ?S_WKS, Data) ->
+    {{A,B,C,D},Proto,BitMap} = Data,
+    BitMapBin = iolist_to_binary(BitMap),
+    {<<A,B,C,D,Proto,BitMapBin/binary>>,Comp};
 encode_data(Comp, Pos, ?S_SOA, Data) ->
     {MName,RName,Serial,Refresh,Retry,Expiry,Minimum} = Data,
     {B1,Comp1} = encode_name(Comp, Pos, MName),
@@ -706,6 +952,25 @@ encode_data(Comp, Pos, ?S_MINFO, Data) ->
 encode_data(Comp, Pos, ?S_MX, Data) ->
     {Pref,Exch} = Data,
     encode_name(<<Pref:16>>, Comp, Pos+2, Exch);
+encode_data(Comp, _, ?S_LOC, Data) ->
+    %% Similar to the Master File Format in section 3 of RFC 1876
+    case Data of
+        {{Latitude, Longitude}, Altitude, Size, {HorizPre, VertPre}} ->
+            ok;
+        {{Latitude, Longitude}, Altitude, Size} ->
+            HorizPre = 10_000_00, VertPre = 10_00,
+            ok;
+        {{Latitude, Longitude}, Altitude} ->
+            Size = 1_00, HorizPre = 10_000_00, VertPre = 10_00,
+            ok
+    end,
+    Version = 0,
+    {<<Version:8, (encode_loc_size(Size))/binary,
+       (encode_loc_size(HorizPre))/binary, (encode_loc_size(VertPre))/binary,
+       (encode_loc_angle(Latitude)):32,
+       (encode_loc_angle(Longitude)):32,
+       (encode_loc_altitude(Altitude)):32>>,
+     Comp};
 encode_data(Comp, Pos, ?S_SRV, Data) ->
     {Prio,Weight,Port,Target} = Data,
     encode_name(<<Prio:16,Weight:16,Port:16>>, Comp, Pos+2+2+2, Target);
@@ -714,11 +979,15 @@ encode_data(Comp, Pos, ?S_NAPTR, Data) ->
     B0 = <<Order:16,Preference:16>>,
     B1 = encode_string(B0, iolist_to_binary(Flags)),
     B2 = encode_string(B1, iolist_to_binary(Services)),
-    B3 = encode_string(B2, unicode:characters_to_binary(Regexp,
-							unicode, utf8)),
-    %% Bypass name compression (RFC 2915: section 2)
-    {B,_} = encode_name(B3, gb_trees:empty(), Pos+byte_size(B3), Replacement),
-    {B,Comp};
+    case unicode:characters_to_binary(Regexp, unicode, utf8) of
+        EncRegexp when is_binary(EncRegexp) ->
+            B3 = encode_string(B2, EncRegexp),
+            %% Bypass name compression (RFC 2915: section 2)
+            {B,_} =
+                encode_name(
+                  B3, gb_trees:empty(), Pos+byte_size(B3), Replacement),
+            {B,Comp}
+    end;
 encode_data(Comp, _, ?S_TXT, Data) -> {encode_txt(Data),Comp};
 encode_data(Comp, _, ?S_SPF, Data) -> {encode_txt(Data),Comp};
 encode_data(Comp, _, ?S_URI, Data) ->
@@ -734,6 +1003,17 @@ encode_data(Comp, _, ?S_CAA, Data)->
         _ ->
             {encode_txt(Data),Comp}
     end;
+encode_data(Comp, _, ?S_TSIG, Data)->
+    {AlgName,Now,Fudge,MAC,OriginalId,Error,OtherData} = Data,
+    %% Bypass name compression (RFC 8945, section 4.2)
+    {AlgNameEncoded,_} = encode_name(gb_trees:empty(), 0, AlgName),
+    MACSize = byte_size(MAC),
+    OtherLen = byte_size(OtherData),
+    DataB = <<AlgNameEncoded/binary,
+	     Now:48, Fudge:16, MACSize:16, MAC:MACSize/binary,
+	     OriginalId:16, Error:16,
+	     OtherLen:16, OtherData:OtherLen/binary>>,
+    {DataB,Comp};
 %%
 %% sofar unknown or non standard
 encode_data(Comp, _Pos, Type, Data) when is_integer(Type) ->
@@ -824,4 +1104,84 @@ encode_labels(Bin, Comp0, Pos, [L|Ls]=Labels)
 	{value,Ptr} ->
 	    %% Name compression - point to already encoded name
 	    {<<Bin/binary,3:2,Ptr:14>>,Comp0}
+    end.
+
+
+decode_loc_angle(X) ->
+    (X - 16#8000_0000) / 3600_000.
+
+encode_loc_angle(X) when is_float(X) ->
+    %% Degrees (1/360 of a turn)
+    encode_loc_angle(round(X * 3600_000));
+encode_loc_angle(X)
+  when is_integer(X), -16#8000_0000 =< X, X =< 16#7FFF_FFFF ->
+    %% 1/1000:s of arc second
+    X + 16#8000_0000.  % Zero is encoded as 2^31
+
+
+decode_loc_altitude(X) ->
+    (X - 100_000_00) / 100.
+
+encode_loc_altitude(X) when is_float(X) ->
+    %% Meters
+    encode_loc_altitude(round(X * 100));
+encode_loc_altitude(X)
+  when is_integer(X), -100_000_00 =< X, X =< 16#FFFF_FFFF - 100_000_00 ->
+    %% Centimeters above a base level 100_000 m below
+    %% the GPS reference spheroid [DoD WGS-1984]
+    X + 100_000_00.
+
+
+decode_loc_size(Base, Exponent) ->
+    round(Base * math:pow(10, Exponent)) / 100.
+
+%% Return the smallest encoded value >= X;
+%% a bit like ceil(X) of encoded values
+%%
+encode_loc_size(X) when is_float(X) ->
+    %% Meters
+    encode_loc_size(round(X * 100));
+encode_loc_size(0) ->
+    0;
+encode_loc_size(X)
+  when is_integer(X), 0 =< X, X =< 9000_000_000 ->
+    %% Centimeters, to be encoded as Digit * 10^Exponent
+    %% with both Digit and Exponent in 0..9,
+    %% limiting the range to 0..9e9
+    %%
+    Exponent = floor(math:log10((X - 0.05) / 0.9)),
+    Multiplier = round(math:pow(10, Exponent)),
+    Base = (X + Multiplier - 1) div Multiplier,
+    <<Base:4, Exponent:4>>.
+
+decode_algname(AlgName) ->
+    case AlgName of
+        ?T_TSIG_HMAC_MD5 -> ?S_TSIG_HMAC_MD5;
+        ?T_TSIG_GSS_TSIG -> ?S_TSIG_GSS_TSIG;
+        ?T_TSIG_HMAC_SHA1 -> ?S_TSIG_HMAC_SHA1;
+        ?T_TSIG_HMAC_SHA1_96 -> ?S_TSIG_HMAC_SHA1_96;
+        ?T_TSIG_HMAC_SHA224 -> ?S_TSIG_HMAC_SHA224;
+        ?T_TSIG_HMAC_SHA256 -> ?S_TSIG_HMAC_SHA256;
+        ?T_TSIG_HMAC_SHA256_128 -> ?S_TSIG_HMAC_SHA256_128;
+        ?T_TSIG_HMAC_SHA384 -> ?S_TSIG_HMAC_SHA384;
+        ?T_TSIG_HMAC_SHA384_192 -> ?S_TSIG_HMAC_SHA384_192;
+        ?T_TSIG_HMAC_SHA512 -> ?S_TSIG_HMAC_SHA512;
+        ?T_TSIG_HMAC_SHA512_256 -> ?S_TSIG_HMAC_SHA512_256;
+       _ -> AlgName  % raw unknown algname
+    end.
+
+encode_algname(Alg) ->
+    case Alg of
+        ?S_TSIG_HMAC_MD5 -> ?T_TSIG_HMAC_MD5;
+        ?S_TSIG_GSS_TSIG -> ?T_TSIG_GSS_TSIG;
+        ?S_TSIG_HMAC_SHA1 -> ?T_TSIG_HMAC_SHA1;
+        ?S_TSIG_HMAC_SHA1_96 -> ?T_TSIG_HMAC_SHA1_96;
+        ?S_TSIG_HMAC_SHA224 -> ?T_TSIG_HMAC_SHA224;
+        ?S_TSIG_HMAC_SHA256 -> ?T_TSIG_HMAC_SHA256;
+        ?S_TSIG_HMAC_SHA256_128 -> ?T_TSIG_HMAC_SHA256_128;
+        ?S_TSIG_HMAC_SHA384 -> ?T_TSIG_HMAC_SHA384;
+        ?S_TSIG_HMAC_SHA384_192 -> ?T_TSIG_HMAC_SHA384_192;
+        ?S_TSIG_HMAC_SHA512 -> ?T_TSIG_HMAC_SHA512;
+        ?S_TSIG_HMAC_SHA512_256 -> ?T_TSIG_HMAC_SHA512_256;
+       Alg when is_list(Alg) -> Alg  % raw unknown algname
     end.

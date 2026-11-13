@@ -1,8 +1,10 @@
 %%
 %% %CopyrightBegin%
-%% 
-%% Copyright Ericsson AB 2000-2021. All Rights Reserved.
-%% 
+%%
+%% SPDX-License-Identifier: Apache-2.0
+%%
+%% Copyright Ericsson AB 2000-2025. All Rights Reserved.
+%%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
 %% You may obtain a copy of the License at
@@ -14,7 +16,7 @@
 %% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 %% See the License for the specific language governing permissions and
 %% limitations under the License.
-%% 
+%%
 %% %CopyrightEnd%
 %%
 
@@ -318,10 +320,10 @@ start_and_stop(doc) ->
 start_and_stop(Config) when is_list(Config) ->
     Pre = fun() ->
 		  p("create nodes"),
-		  ServerNode = make_node_name(server),
-		  ClientNode = make_node_name(client),
+		  ServerNode = make_node_name(t_sas_server),
+		  ClientNode = make_node_name(t_sas_client),
 		  Nodes = [ServerNode, ClientNode], 
-		  ok = ?START_NODES(Nodes),
+		  ok = ?START_NODES(Nodes, true),
 		  Nodes
 	  end,
     Case = fun(X) -> do_start_and_stop(Config, X) end,
@@ -461,10 +463,10 @@ sendreceive(suite) ->
 sendreceive(Config) when is_list(Config) ->
     Pre = fun() ->
 		  p("create nodes"),
-		  ServerNode = make_node_name(server),
-		  ClientNode = make_node_name(client),
+		  ServerNode = make_node_name(t_sr_server),
+		  ClientNode = make_node_name(t_sr_client),
 		  Nodes = [ServerNode, ClientNode], 
-		  ok = ?START_NODES(Nodes),
+		  ok = ?START_NODES(Nodes, true),
 		  Nodes
 	  end,
     Case = fun(X) -> do_sendreceive(Config, X) end,
@@ -475,15 +477,22 @@ sendreceive(Config) when is_list(Config) ->
     try_tc(sendreceive, Pre, Case, Post).
 
 do_sendreceive(Config, [ServerNode, ClientNode]) ->
-    %% Create command sequences
-    p("create command sequences"),
-    ServerPort = ?SERVER_PORT(Config, 2), % 2944,
-    ServerCmds = sendreceive_server_commands(Config, ServerPort),
+    p("retrieve server info (host and port)"),
+    ServerPort       = ?SERVER_PORT(Config, 2), % 2944,
     {ok, ServerHost} = inet:gethostname(),
+
+    %% Create command sequences
+    p("create server command sequence: "
+      "~n      Server Port: ~p"
+      "~n      Server Host: ~p", [ServerPort, ServerHost]),
+    ServerCmds = sendreceive_server_commands(Config, ServerPort, ServerHost),
+    p("create client command sequence: "
+      "~n      Server Port: ~p"
+      "~n      Server Host: ~p", [ServerPort, ServerHost]),
     ClientCmds = sendreceive_client_commands(Config, ServerPort, ServerHost),
 
     %% Start the test procs used in the test-case, one for each node
-    p("start command handlers"),
+    p("start command handler(s)"),
     Server = server_start_command_handler(ServerNode, ServerCmds),
     p("server command handler started: ~p", [Server]),
     Client = client_start_command_handler(ClientNode, ClientCmds),
@@ -496,8 +505,8 @@ do_sendreceive(Config, [ServerNode, ClientNode]) ->
     ok.
 
 
-sendreceive_server_commands(Config, Port) ->
-    Opts = [{port, Port}], 
+sendreceive_server_commands(Config, Port, Host) ->
+    Opts = [{host, Host}, {port, Port}], 
     Self = self(),
     [
      #{id   => 1,
@@ -666,10 +675,10 @@ block_unblock(suite) ->
 block_unblock(Config) when is_list(Config) ->
     Pre = fun() ->
 		  p("create nodes"),
-		  ServerNode = make_node_name(server),
-		  ClientNode = make_node_name(client),
+		  ServerNode = make_node_name(t_bb_server),
+		  ClientNode = make_node_name(t_bb_client),
 		  Nodes = [ServerNode, ClientNode], 
-		  ok = ?START_NODES(Nodes),
+		  ok = ?START_NODES(Nodes, true),
 		  Nodes
 	  end,
     Case = fun(X) -> do_block_unblock(Config, X) end,
@@ -1047,14 +1056,22 @@ process_received_message(ReceiveHandle, ControlPid, SendHandle, BinMsg)
 await_server_listening(Server, Client) ->
     receive
         {listening, Server} ->
-            p("received listening message from server [~p] => "
+            p("[await-server-listening] "
+              "received listening message from server [~p] => "
               "send continue to client [~p]"
               "~n", [Server, Client]),
             Client ! {continue, self()},
             ok;
 	{'EXIT', Server, SReason} ->
+            p("[await-server-listening] unexpected server (~p) exit: "
+              "~n       ~p"
+              "~n", [Server, SReason]),
 	    exit({server_crash, SReason});
 	{'EXIT', Client, CReason} ->
+            p("[await-server-listening] "
+              "unexpected client (~p) exit: "
+              "~n       ~p"
+              "~n", [Client, CReason]),
 	    exit({client_crash, CReason})
     after 5000 ->
             %% There is no normal reason why this should take any time.
@@ -1069,13 +1086,22 @@ await_server_listening(Server, Client) ->
 await_client_blocked(Server, Client) ->
     receive
         {blocked, Client} ->
-            p("received blocked message from client [~p] => "
+            p("[await-client-blocked] "
+              "received blocked message from client [~p] => "
               "send continue to server [~p]~n", [Client, Server]),
             Server ! {continue, self()},
             ok;
 	{'EXIT', Client, CReason} ->
+            p("[await-client-blocked] "
+              "unexpected client (~p) exit: "
+              "~n       ~p"
+              "~n", [Client, CReason]),
 	    exit({client_crash, CReason});
 	{'EXIT', Server, SReason} ->
+            p("[await-client-blocked] "
+              "unexpected server (~p) exit: "
+              "~n       ~p"
+              "~n", [Server, SReason]),
 	    exit({server_crash, SReason})
     after 5000 ->
             %% There is no normal reason why this should take any time.

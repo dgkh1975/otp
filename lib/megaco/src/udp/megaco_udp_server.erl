@@ -1,8 +1,10 @@
 %%
 %% %CopyrightBegin%
-%% 
-%% Copyright Ericsson AB 1999-2021. All Rights Reserved.
-%% 
+%%
+%% SPDX-License-Identifier: Apache-2.0
+%%
+%% Copyright Ericsson AB 1999-2025. All Rights Reserved.
+%%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
 %% You may obtain a copy of the License at
@@ -14,7 +16,7 @@
 %% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 %% See the License for the specific language governing permissions and
 %% limitations under the License.
-%% 
+%%
 %% %CopyrightEnd%
 %%
 
@@ -26,6 +28,7 @@
 %%
 %%-----------------------------------------------------------------
 -module(megaco_udp_server).
+-moduledoc false.
 
 -behaviour(gen_server).
 
@@ -149,11 +152,14 @@ handle_cast(Msg, UdpRec) ->
 %% Description: Handling non call/cast messages. Incomming messages
 %%              from the socket and exit codes.
 %%-----------------------------------------------------------------
+
 handle_info({udp, _Socket, Ip, Port, Msg}, 
-	    #megaco_udp{serialize = false} = UdpRec) ->
-    #megaco_udp{socket = Socket, module = Mod, receive_handle = RH} = UdpRec,
-    SH = megaco_udp:create_send_handle(Socket, Ip, Port), 
-    MsgSize = size(Msg),
+	    #megaco_udp{serialize = false} = UdpRec) when is_binary(Msg) ->
+    #megaco_udp{handle = Handle,
+                socket = Socket,
+                module = Mod, receive_handle = RH} = UdpRec,
+    SH = megaco_udp:create_send_handle(Handle, Ip, Port), 
+    MsgSize = byte_size(Msg),
     incNumInMessages(SH),
     incNumInOctets(SH, MsgSize),
     case MsgSize of
@@ -162,17 +168,19 @@ handle_info({udp, _Socket, Ip, Port, Msg},
 	Sz ->
 	    receive_message(Mod, RH, SH, Sz, Msg)
     end,
-    activate(Socket),
+    _ = activate(Socket),
     {noreply, UdpRec};
 handle_info({udp, _Socket, Ip, Port, Msg}, 
-	    #megaco_udp{serialize = true} = UdpRec) ->
-    #megaco_udp{socket = Socket, module = Mod, receive_handle = RH} = UdpRec,
-    SH = megaco_udp:create_send_handle(Socket, Ip, Port), 
-    MsgSize = size(Msg),
+	    #megaco_udp{serialize = true} = UdpRec) when is_binary(Msg) ->
+    #megaco_udp{handle = Handle,
+                socket = Socket,
+                module = Mod, receive_handle = RH} = UdpRec,
+    SH = megaco_udp:create_send_handle(Handle, Ip, Port), 
+    MsgSize = byte_size(Msg),
     incNumInMessages(SH),
     incNumInOctets(SH, MsgSize),
     process_received_message(Mod, RH, SH, Msg),
-    activate(Socket),
+    _ = activate(Socket),
     {noreply, UdpRec};
 handle_info(Info, UdpRec) ->
     warning_msg("received unexpected info: "
@@ -211,8 +219,8 @@ handle_received_message(Mod, RH, Parent, SH, Msg) ->
 code_change(_Vsn, State, _Extra) ->
     {ok, State}.
 
-do_stop(#megaco_udp{socket = Socket}) ->
-    gen_udp:close(Socket).
+do_stop(#megaco_udp{handle = Handle}) ->
+    megaco_udp:close(Handle).
 
 
 -compile({inline, [activate/1]}).

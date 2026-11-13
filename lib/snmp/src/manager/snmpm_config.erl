@@ -1,7 +1,9 @@
 %% 
 %% %CopyrightBegin%
 %%
-%% Copyright Ericsson AB 2004-2020. All Rights Reserved.
+%% SPDX-License-Identifier: Apache-2.0
+%%
+%% Copyright Ericsson AB 2004-2026. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -25,8 +27,12 @@
 %% -------------------------------------------------------------------------
 
 -module(snmpm_config).
+-moduledoc false.
 
 -behaviour(gen_server).
+
+-compile([{nowarn_possibly_unsafe_function, {erlang, list_to_atom, 1}},
+          {nowarn_deprecated_function, [{erlang,exit,2}]}]).
 
 %% External exports
 %% Avoid warning for local function error/1 clashing with autoimported BIF.
@@ -39,9 +45,9 @@
 	 register_agent/3, unregister_agent/2, 
 	 agent_info/0, agent_info/2, agent_info/3, 
 	 update_agent_info/3,
-	 which_agents/0, which_agents/1, 
+	 which_agents/0, which_agents/1, which_agents/2,
 
-	 is_known_engine_id/2, 
+	 is_known_engine_id/1, is_known_engine_id/2,
 	 get_agent_engine_id/1, 
 	 get_agent_engine_max_message_size/1, 
 	 get_agent_version/1, 
@@ -122,6 +128,7 @@
 -include_lib("kernel/include/file.hrl").
 -include("snmp_types.hrl").
 -include("snmpm_internal.hrl").
+-include("snmp_usm.hrl").
 -include("snmpm_usm.hrl").
 -include("snmp_debug.hrl").
 -include("snmp_verbosity.hrl").
@@ -520,14 +527,31 @@ which_agents() ->
     which_agents('_').
 
 which_agents(UserId) ->
-    Pat = {{'$1', user_id}, UserId},
-    Agents = ets:match(snmpm_agent_table, Pat),
-    [TargetName || [TargetName] <- Agents].
+    which_agents(user_id, UserId).
 
+%% Choose agent(s) based on UserId or EngineID
+which_agents(Key = user_id, UserId) ->
+    do_which_agents(Key, UserId);
+which_agents(Key = engine_id, EngineID) ->
+    do_which_agents(Key, EngineID).
 
+do_which_agents(Key, Value) ->
+    Pat = {{'$1', Key}, Value},
+    [TargetName || [TargetName] <- ets:match(snmpm_agent_table, Pat)].
+    
 
 update_agent_info(UserId, TargetName, Info) ->
     call({update_agent_info, UserId, TargetName, Info}).
+
+is_known_engine_id(EngineID) ->
+    case which_agents(engine_id, EngineID) of
+        [] ->
+            false;
+        Targets ->
+            ?vdebug("~w -> Targets: "
+                    "~n   ~p", [?FUNCTION_NAME, Targets]),
+            true
+    end.
 
 is_known_engine_id(EngineID, TargetName) ->
     case agent_info(TargetName, engine_id) of
@@ -678,7 +702,8 @@ get_usm_etime(SnmpEngineID) ->
     Key = {etime, SnmpEngineID},
     case get_usm_cache(Key) of
 	{ok, Diff} ->
-	    {ok, snmp_misc:now(sec) - Diff};
+            ETime = snmp_misc:now(sec) - Diff,
+            {ok, ETime};
 	_ ->
 	    {ok, 0}
     end.
@@ -2134,6 +2159,7 @@ verify_usm_user(AuthP, AuthKey, PrivP, PrivKey) ->
     verify_usm_user_priv(PrivP, PrivKey),
     ok.
 
+
 verify_usm_user_auth(usmNoAuthProtocol, AuthKey) ->
     case (catch snmp_conf:check_string(AuthKey, any)) of
 	ok ->
@@ -2141,6 +2167,7 @@ verify_usm_user_auth(usmNoAuthProtocol, AuthKey) ->
 	_ ->
 	    error({invalid_auth_key, usmNoAuthProtocol})
     end;
+
 verify_usm_user_auth(usmHMACMD5AuthProtocol, AuthKey) 
   when is_list(AuthKey) andalso (length(AuthKey) =:= 16) ->
     case is_crypto_supported(md5) of
@@ -2159,6 +2186,7 @@ verify_usm_user_auth(usmHMACMD5AuthProtocol, AuthKey) when is_list(AuthKey) ->
     error({invalid_auth_key, usmHMACMD5AuthProtocol, Len});
 verify_usm_user_auth(usmHMACMD5AuthProtocol, _AuthKey) ->
     error({invalid_auth_key, usmHMACMD5AuthProtocol});
+
 verify_usm_user_auth(usmHMACSHAAuthProtocol, AuthKey) 
   when is_list(AuthKey) andalso (length(AuthKey) =:= 20) ->
     case is_crypto_supported(sha) of
@@ -2177,9 +2205,91 @@ verify_usm_user_auth(usmHMACSHAAuthProtocol, AuthKey) when is_list(AuthKey) ->
     error({invalid_auth_key, usmHMACSHAAuthProtocol, Len});
 verify_usm_user_auth(usmHMACSHAAuthProtocol, _AuthKey) ->
     error({invalid_auth_key, usmHMACSHAAuthProtocol});
+
+verify_usm_user_auth(usmHMAC128SHA224AuthProtocol, AuthKey) 
+  when is_list(AuthKey) andalso
+       (length(AuthKey) =:= ?usmHMAC128SHA224AuthProtocol_secret_key_length) ->
+    case is_crypto_supported(sha224) of
+	true -> 
+	    case snmp_conf:all_integer(AuthKey) of
+		true ->
+		    ok;
+		_ ->
+		    error({invalid_auth_key, usmHMAC128SHA224AuthProtocol})
+	    end;
+	false -> 
+	    error({unsupported_crypto, sha224})
+    end;
+verify_usm_user_auth(usmHMAC128SHA224AuthProtocol, AuthKey) when is_list(AuthKey) ->
+    Len = length(AuthKey),
+    error({invalid_auth_key, usmHMAC128SHA224AuthProtocol, Len});
+verify_usm_user_auth(usmHMAC128SHA224AuthProtocol, _AuthKey) ->
+    error({invalid_auth_key, usmHMAC128SHA224AuthProtocol});
+
+verify_usm_user_auth(usmHMAC192SHA256AuthProtocol, AuthKey) 
+  when is_list(AuthKey) andalso
+       (length(AuthKey) =:= ?usmHMAC192SHA256AuthProtocol_secret_key_length) ->
+    case is_crypto_supported(sha256) of
+	true -> 
+	    case snmp_conf:all_integer(AuthKey) of
+		true ->
+		    ok;
+		_ ->
+		    error({invalid_auth_key, usmHMAC192SHA256AuthProtocol})
+	    end;
+	false -> 
+	    error({unsupported_crypto, sha256})
+    end;
+verify_usm_user_auth(usmHMAC192SHA256AuthProtocol, AuthKey) when is_list(AuthKey) ->
+    Len = length(AuthKey),
+    error({invalid_auth_key, usmHMAC192SHA256AuthProtocol, Len});
+verify_usm_user_auth(usmHMAC192SHA256AuthProtocol, _AuthKey) ->
+    error({invalid_auth_key, usmHMAC192SHA256AuthProtocol});
+
+verify_usm_user_auth(usmHMAC256SHA384AuthProtocol, AuthKey) 
+  when is_list(AuthKey) andalso
+       (length(AuthKey) =:= ?usmHMAC256SHA384AuthProtocol_secret_key_length) ->
+    case is_crypto_supported(sha384) of
+	true -> 
+	    case snmp_conf:all_integer(AuthKey) of
+		true ->
+		    ok;
+		_ ->
+		    error({invalid_auth_key, usmHMAC256SHA384AuthProtocol})
+	    end;
+	false -> 
+	    error({unsupported_crypto, sha384})
+    end;
+verify_usm_user_auth(usmHMAC256SHA384AuthProtocol, AuthKey) when is_list(AuthKey) ->
+    Len = length(AuthKey),
+    error({invalid_auth_key, usmHMAC256SHA384AuthProtocol, Len});
+verify_usm_user_auth(usmHMAC256SHA384AuthProtocol, _AuthKey) ->
+    error({invalid_auth_key, usmHMAC256SHA384AuthProtocol});
+
+verify_usm_user_auth(usmHMAC384SHA512AuthProtocol, AuthKey) 
+  when is_list(AuthKey) andalso
+       (length(AuthKey) =:= ?usmHMAC384SHA512AuthProtocol_secret_key_length) ->
+    case is_crypto_supported(sha512) of
+	true -> 
+	    case snmp_conf:all_integer(AuthKey) of
+		true ->
+		    ok;
+		_ ->
+		    error({invalid_auth_key, usmHMAC384SHA512AuthProtocol})
+	    end;
+	false -> 
+	    error({unsupported_crypto, sha512})
+    end;
+verify_usm_user_auth(usmHMAC384SHA512AuthProtocol, AuthKey) when is_list(AuthKey) ->
+    Len = length(AuthKey),
+    error({invalid_auth_key, usmHMAC384SHA512AuthProtocol, Len});
+verify_usm_user_auth(usmHMAC384SHA512AuthProtocol, _AuthKey) ->
+    error({invalid_auth_key, usmHMAC384SHA512AuthProtocol});
+
 verify_usm_user_auth(AuthP, _AuthKey) ->
     error({invalid_auth_protocol, AuthP}).
     
+
 verify_usm_user_priv(usmNoPrivProtocol, PrivKey) ->
     case (catch snmp_conf:check_string(PrivKey, any)) of
 	ok ->
@@ -2660,7 +2770,7 @@ stop_backup_server({Pid, _}) when is_pid(Pid) ->
 %%----------------------------------------------------------
 
 handle_backup(D, BackupDir) ->
-    %% First check that we do not wrote to the corrent db-dir...
+    %% First check that we do not wrote to the current db-dir...
     ?vtrace("handle_backup -> entry with"
         "~n   D:         ~p"
         "~n   BackupDir: ~p", [D, BackupDir]),
@@ -2965,13 +3075,19 @@ do_update_usm_user_info(Key, User, sec_name, Val) ->
     %% end;
     ok = verify_usm_user_sec_name(Val),
     do_update_usm_user_info(Key, User#usm_user{sec_name = Val});
+
 do_update_usm_user_info(Key, User, auth, Val) 
   when (Val =:= usmNoAuthProtocol) orelse 
        (Val =:= usmHMACMD5AuthProtocol) orelse
-       (Val =:= usmHMACSHAAuthProtocol) ->
+       (Val =:= usmHMACSHAAuthProtocol) orelse
+       (Val =:= usmHMAC128SHA224AuthProtocol) orelse
+       (Val =:= usmHMAC192SHA256AuthProtocol) orelse
+       (Val =:= usmHMAC256SHA384AuthProtocol) orelse
+       (Val =:= usmHMAC384SHA512AuthProtocol) ->
     do_update_usm_user_info(Key, User#usm_user{auth = Val});
 do_update_usm_user_info(_Key, _User, auth, Val) ->
     {error, {invalid_auth_protocol, Val}};
+
 do_update_usm_user_info(Key, 
 			#usm_user{auth = usmNoAuthProtocol} = User, 
 			auth_key, Val) ->
@@ -2981,6 +3097,7 @@ do_update_usm_user_info(Key,
 	_ ->
 	    {error, {invalid_auth_key, Val}}
     end;
+
 do_update_usm_user_info(Key, 
 			#usm_user{auth = usmHMACMD5AuthProtocol} = User, 
 			auth_key, Val) 
@@ -3000,6 +3117,7 @@ do_update_usm_user_info(_Key,
 			#usm_user{auth = usmHMACMD5AuthProtocol}, 
 			auth_key, Val) ->
     {error, {invalid_auth_key, usmHMACMD5AuthProtocol, Val}};
+
 do_update_usm_user_info(Key, 
 			#usm_user{auth = usmHMACSHAAuthProtocol} = User, 
 			auth_key, Val) 
@@ -3019,6 +3137,87 @@ do_update_usm_user_info(_Key,
 			#usm_user{auth = usmHMACSHAAuthProtocol}, 
 			auth_key, Val) ->
     {error, {invalid_auth_key, usmHMACSHAAuthProtocol, Val}};
+
+do_update_usm_user_info(Key,
+			#usm_user{auth = usmHMAC128SHA224AuthProtocol} = User,
+			auth_key, Val)
+  when (length(Val) =:= ?usmHMAC128SHA224AuthProtocol_secret_key_length) ->
+    case is_crypto_supported(sha224) of
+	true ->
+	    do_update_usm_user_info(Key, User#usm_user{auth_key = Val});
+	false ->
+	    {error, {unsupported_crypto, sha224}}
+    end;
+do_update_usm_user_info(_Key, 
+			#usm_user{auth = usmHMAC128SHA224AuthProtocol = Auth}, 
+			auth_key, Val) when is_list(Val) ->
+    Len = length(Val),
+    {error, {invalid_auth_key_length, Auth, Len}};
+do_update_usm_user_info(_Key, 
+			#usm_user{auth = usmHMAC128SHA224AuthProtocol = Auth}, 
+			auth_key, Val) ->
+    {error, {invalid_auth_key, Auth, Val}};
+
+do_update_usm_user_info(Key,
+			#usm_user{auth = usmHMAC192SHA256AuthProtocol} = User,
+			auth_key, Val)
+  when (length(Val) =:= ?usmHMAC192SHA256AuthProtocol_secret_key_length) ->
+    case is_crypto_supported(sha256) of
+	true ->
+	    do_update_usm_user_info(Key, User#usm_user{auth_key = Val});
+	false ->
+	    {error, {unsupported_crypto, sha256}}
+    end;
+do_update_usm_user_info(_Key, 
+			#usm_user{auth = usmHMAC192SHA256AuthProtocol = Auth}, 
+			auth_key, Val) when is_list(Val) ->
+    Len = length(Val),
+    {error, {invalid_auth_key_length, Auth, Len}};
+do_update_usm_user_info(_Key, 
+			#usm_user{auth = usmHMAC192SHA256AuthProtocol = Auth}, 
+			auth_key, Val) ->
+    {error, {invalid_auth_key, Auth, Val}};
+
+do_update_usm_user_info(Key,
+			#usm_user{auth = usmHMAC256SHA384AuthProtocol} = User,
+			auth_key, Val)
+  when (length(Val) =:= ?usmHMAC256SHA384AuthProtocol_secret_key_length) ->
+    case is_crypto_supported(sha384) of
+	true ->
+	    do_update_usm_user_info(Key, User#usm_user{auth_key = Val});
+	false ->
+	    {error, {unsupported_crypto, sha384}}
+    end;
+do_update_usm_user_info(_Key, 
+			#usm_user{auth = usmHMAC256SHA384AuthProtocol = Auth}, 
+			auth_key, Val) when is_list(Val) ->
+    Len = length(Val),
+    {error, {invalid_auth_key_length, Auth, Len}};
+do_update_usm_user_info(_Key, 
+			#usm_user{auth = usmHMAC256SHA384AuthProtocol = Auth}, 
+			auth_key, Val) ->
+    {error, {invalid_auth_key, Auth, Val}};
+
+do_update_usm_user_info(Key,
+			#usm_user{auth = usmHMAC384SHA512AuthProtocol} = User,
+			auth_key, Val)
+  when (length(Val) =:= ?usmHMAC384SHA512AuthProtocol_secret_key_length) ->
+    case is_crypto_supported(sha512) of
+	true ->
+	    do_update_usm_user_info(Key, User#usm_user{auth_key = Val});
+	false ->
+	    {error, {unsupported_crypto, sha512}}
+    end;
+do_update_usm_user_info(_Key, 
+			#usm_user{auth = usmHMAC384SHA512AuthProtocol = Auth}, 
+			auth_key, Val) when is_list(Val) ->
+    Len = length(Val),
+    {error, {invalid_auth_key_length, Auth, Len}};
+do_update_usm_user_info(_Key, 
+			#usm_user{auth = usmHMAC384SHA512AuthProtocol = Auth}, 
+			auth_key, Val) ->
+    {error, {invalid_auth_key, Auth, Val}};
+
 do_update_usm_user_info(Key, User, priv, Val) 
   when (Val =:= usmNoPrivProtocol) orelse 
        (Val =:= usmDESPrivProtocol) orelse

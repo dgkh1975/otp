@@ -1,7 +1,9 @@
 %%
 %% %CopyrightBegin%
 %%
-%% Copyright Ericsson AB 2011-2017. All Rights Reserved.
+%% SPDX-License-Identifier: Apache-2.0
+%%
+%% Copyright Ericsson AB 2011-2026. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -18,6 +20,10 @@
 %% %CopyrightEnd%
 
 -module(observer_trace_wx).
+-moduledoc false.
+
+-compile([{nowarn_possibly_unsafe_function, {erlang, list_to_atom, 1}},
+          {nowarn_possibly_unsafe_function, {file, consult, 1}}]).
 
 -export([start_link/3, add_processes/1, add_ports/1]).
 -export([init/1, handle_info/2, terminate/2, code_change/3, handle_call/3,
@@ -361,7 +367,7 @@ handle_event(#wx{event = #wxCommand{type = command_togglebutton_clicked, command
 	(TProcs == []) andalso (TPorts == []) andalso throw({error, "No processes or ports traced"}),
 	(Nodes == []) andalso throw({error, "No nodes traced"}),
 	HaveCallTrace = fun(#titem{opts=Os}) -> lists:member(functions,Os) end,
-	WStr = "Call trace actived but no trace patterns used",
+	WStr = "Call trace activated but no trace patterns used",
 	(TPs == []) andalso lists:any(HaveCallTrace, TProcs) andalso
 	    observer_wx:create_txt_dialog(Panel, WStr, "Warning", ?wxICON_WARNING),
 
@@ -397,6 +403,10 @@ handle_event(#wx{id=Id, obj=LogWin, event=Ev},
 	_ ->
 	    {noreply, State}
     end;
+
+handle_event(#wx{id=?wxID_CLOSE, obj=Obj, event=#wxCommand{type=command_menu_selected}}, State) ->
+    wxWindow:close(Obj, []),
+    {noreply, State};
 
 handle_event(#wx{id=?LOG_CLEAR, userData=TCtrl}, State) ->
     wxTextCtrl:clear(TCtrl),
@@ -697,7 +707,7 @@ handle_event(#wx{id=?REMOVE_NODES}, #state{n_view=Nview, nodes=Ns0} = State) ->
     {noreply, State#state{nodes = Ns}};
 
 handle_event(#wx{id=ID, event = What}, State) ->
-    io:format("~p:~p: Unhandled event: ~p, ~tp ~n", [?MODULE, ?LINE, ID, What]),
+    io:format(user,"~p:~p: Unhandled event: ~p, ~tp ~n", [?MODULE, ?LINE, ID, What]),
     {noreply, State}.
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
@@ -763,7 +773,7 @@ do_add_patterns({Module, NewPs}, State=#state{tpatterns=TPs0, m_view=Mview, f_vi
 	{Old, [], []} ->
 	    State;
 	{MPatterns, _New, _Changed} ->
-	    %% if dynamicly updates update New and Changed
+	    %% if dynamically updates update New and Changed
 	    TPs = dict:store(Module, MPatterns, TPs0),
 	    update_modules_view(lists:sort(dict:fetch_keys(TPs)), Module, Mview),
 	    update_functions_view(dict:fetch(Module, TPs), Fview),
@@ -987,8 +997,8 @@ create_logwindow(Parent, true) ->
     LogWin = wxFrame:new(Parent, ?LOG_WIN, "Trace Log", [{size, {750*Scale, 800*Scale}}]),
     MB = wxMenuBar:new(),
     File = wxMenu:new(),
-    wxMenu:append(File, ?LOG_CLEAR, "Clear Log\tCtrl-C"),
-    wxMenu:append(File, ?LOG_SAVE, "Save Log\tCtrl-S"),
+    wxMenu:append(File, ?LOG_CLEAR, "Clear Log\tCtrl+C"),
+    wxMenu:append(File, ?LOG_SAVE, "Save Log\tCtrl+S"),
     wxMenu:append(File, ?wxID_CLOSE, "Close"),
     wxMenuBar:append(MB, File, "File"),
     wxFrame:setMenuBar(LogWin, MB),
@@ -1048,7 +1058,7 @@ textformat(Trace) when element(1, Trace) == trace_ts, tuple_size(Trace) >= 4 ->
 textformat(Trace) when element(1, Trace) == drop, tuple_size(Trace) =:= 2 ->
     io_lib:format("*** Dropped ~p messages.~n", [element(2,Trace)]);
 textformat(Trace) when element(1, Trace) == seq_trace, tuple_size(Trace) >= 3 ->
-    io_lib:format("*** Seq trace not implmented.~n", []);
+    io_lib:format("*** Seq trace not implemented.~n", []);
 textformat(_) ->
     "".
 

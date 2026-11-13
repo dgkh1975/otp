@@ -1,8 +1,10 @@
 %%
 %% %CopyrightBegin%
-%% 
-%% Copyright Ericsson AB 2005-2021. All Rights Reserved.
-%% 
+%%
+%% SPDX-License-Identifier: Apache-2.0
+%%
+%% Copyright Ericsson AB 2005-2026. All Rights Reserved.
+%%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
 %% You may obtain a copy of the License at
@@ -14,11 +16,12 @@
 %% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 %% See the License for the specific language governing permissions and
 %% limitations under the License.
-%% 
+%%
 %% %CopyrightEnd%
 %%
 
 -module(http_request).
+-moduledoc false.
 
 -include("http_internal.hrl").
 
@@ -28,21 +31,20 @@
 key_value(KeyValueStr) ->
     case lists:splitwith(fun($:) -> false; (_) -> true end, KeyValueStr) of
 	{Key, [$: | Value]} when Key =/= [] ->
-            %% RFC 7230 - 3.2.4 ... No whitespace is allowed between the header field-name and colon. 
-            case string:strip(Key, right) of
+            %% RFC 7230 - 3.2.4 ... No whitespace is allowed between the header field-name and colon.
+            case string:trim(Key, trailing) of
                 Key ->
-                    {http_util:to_lower(string:strip(Key, left)),  string:strip(Value)};
-                 _ ->
-                    %% Ignore invalid header
-                    undefined
+                    {http_util:to_lower(string:trim(Key, leading)),  string:trim(Value)};
+                _ ->
+                    {error, whitespace_before_colon}
             end;
-	{_, []} -> 
+	{_, []} ->
 	    undefined;
         _ ->
-            undefined 
+            undefined
     end.
 %%-------------------------------------------------------------------------
-%% headers(HeaderList, #http_request_h{}) -> #http_request_h{}
+%% headers(HeaderList, #http_request_h{}) -> #http_request_h{} | {error, term()}
 %%   HeaderList - ["HeaderField:Value"]     	
 %%   HeaderField - string()
 %%   Value - string()	
@@ -52,6 +54,8 @@ key_value(KeyValueStr) ->
 %%-------------------------------------------------------------------------
 headers([], Headers) ->
     Headers;
+headers([{error, _} = Error | _], _Headers) ->
+    Error;
 headers([{Key, Value} | Tail], Headers) ->  
     headers(Tail, headers(Key, Value, Headers));
 headers([undefined], Headers) -> 
@@ -103,11 +107,9 @@ is_absolut_uri(_) ->
 %% Description: returns a normalized Host header value, with the port
 %% number omitted for well-known ports
 %%-------------------------------------------------------------------------
-normalize_host(https, Host, Port) when Port =:= 443 orelse
-                                       Port =:= undefined ->
+normalize_host(https, Host, 443 = _Port) ->
     Host;
-normalize_host(http, Host, Port) when Port =:= 80 orelse
-                                      Port =:= undefined ->
+normalize_host(http, Host, 80 = _Port) ->
     Host;
 normalize_host(_Scheme, Host, Port) ->
     Host ++ ":" ++ integer_to_list(Port).
@@ -203,7 +205,8 @@ headers(Key, Value, Headers) ->
 
 key_value_str(Key, Headers) ->
     case key_value(Key, Headers) of
-        undefined -> undefined;
+        undefined ->
+            undefined;
         Value ->
             mk_key_value_str(atom_to_list(Key), Value)
     end.
@@ -291,7 +294,13 @@ headers_other([{Key, Value} | Rest], Headers) ->
     headers_other(Rest, [mk_key_value_str(Key, Value) | Headers]).
 
 mk_key_value_str(Key, Value) ->
-    Key ++ ": " ++ value_to_list(Value) ++ ?CRLF.
+    try Key ++ ": " ++ value_to_list(Value) ++ ?CRLF of
+        HeaderStr ->
+            HeaderStr
+    catch
+        error:_ ->
+            throw({invalid_header, {Key, Value}})
+    end.
 
 value_to_list(Binary) when is_binary(Binary) ->
     binary_to_list(Binary);

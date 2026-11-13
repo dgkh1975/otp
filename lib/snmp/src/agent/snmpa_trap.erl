@@ -1,7 +1,9 @@
 %%
 %% %CopyrightBegin%
 %%
-%% Copyright Ericsson AB 1996-2020. All Rights Reserved.
+%% SPDX-License-Identifier: Apache-2.0
+%%
+%% Copyright Ericsson AB 1996-2025. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -18,6 +20,7 @@
 %% %CopyrightEnd%
 %%
 -module(snmpa_trap).
+-moduledoc false.
 
 %%%-----------------------------------------------------------------
 %%% This module takes care of all trap(notification handling.
@@ -69,9 +72,9 @@
 %%   operation, and so on, until eventually the MA will receive the
 %%   info. The MA then fills in the gaps, and at this point all
 %%   oids and types must be known, otherwise an error is signalled,
-%%   and the opertaion is aborted. For the unknown values for some 
+%%   and the operation is aborted. For the unknown values for some 
 %%   oids, a get-operation is performed by the MA. This will
-%%   retreive the missing values.
+%%   retrieve the missing values.
 %%   At this point, all oid, types and values are known, so the MA
 %%   can distribute the traps according to the information in the
 %%   internal tables.
@@ -123,7 +126,7 @@
 %%          Initialize as many variables as possible.
 %% Returns: {ok, TrapRecord, <list of Var>} | error
 %%          where Var is returned from initiate_vars.
-%% NOTE: Executed at the inital SA
+%% NOTE: Executed at the initial SA
 %%-----------------------------------------------------------------
 construct_trap(Trap, Varbinds) ->
     ?vdebug("construct_trap -> entry with"
@@ -213,7 +216,7 @@ alias2oid(Alias, Append) ->
 %%            {{Process, VariableOid}, Value} |
 %%            {{Process, VariableAtom}, Value} |
 %%            {TableColAtom, RowIndex, Value}
-%% NOTE: Executed at the inital SA
+%% NOTE: Executed at the initial SA
 %%-----------------------------------------------------------------
 initiate_vars([{Oid, Asn1Type} | T], Varbinds) ->
     case delete_oid_from_varbinds(Oid, Varbinds) of
@@ -405,7 +408,7 @@ send_trap(TrapRec, NotifyName, ContextName, Recv, Vbs, ExtraInfo, NetIf) ->
 	      LocalEngineID, ExtraInfo, NetIf).
 
 %% The agent normally does not care about the result, 
-%% but since it can be usefull when debugging, add 
+%% but since it can be useful when debugging, add 
 %% some info when we fail to send the trap(s).
 send_trap(TrapRec, NotifyName, ContextName, Recv, Vbs, LocalEngineID, 
 	  ExtraInfo, NetIf) ->

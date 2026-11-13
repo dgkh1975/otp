@@ -1,7 +1,9 @@
 %% 
 %% %CopyrightBegin%
 %%
-%% Copyright Ericsson AB 2004-2021. All Rights Reserved.
+%% SPDX-License-Identifier: Apache-2.0
+%%
+%% Copyright Ericsson AB 2004-2025. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -20,6 +22,7 @@
 
 -ifndef(snmpm_net_if_mt).
 -module(snmpm_net_if).
+-moduledoc false.
 -endif.
 
 -behaviour(gen_server).
@@ -292,21 +295,40 @@ do_init(Server, NoteStore) ->
     ?vdebug("DomainAddresses: ~w", [DomainAddresses]),
     CommonSocketOpts = common_socket_opts(Opts),
     BindTo = get_opt(Opts, bind_to, false),
-    InetBackend = case get_opt(Opts, inet_backend, use_default) of
-                      use_default -> [];
-                      IB          -> [{inet_backend, IB}]
-                  end,
+    {RequireBind, InetBackend} =
+	case get_opt(Opts, inet_backend, use_default) of
+	    use_default ->
+		{false, []};
+	    IB when (IB =:= inet) ->
+		{false, [{inet_backend, IB}]};
+	    IB when (IB =:= socket) ->
+		{case os:type() of
+		     {win32, nt} ->
+			 true;
+		     _ ->
+			 false
+		 end,
+		 [{inet_backend, IB}]}
+	end,
     case
 	[begin
 	     {IpPort, SocketOpts} =
-		 socket_params(Domain, Address, BindTo, CommonSocketOpts),
+		 socket_params(Domain, Address,
+			       RequireBind, BindTo, CommonSocketOpts),
              %% The 'inet-backend' option has to be first,
              %% so we might as well add it last.
 	     Socket = socket_open(IpPort, InetBackend ++ SocketOpts),
+	     PortInfoStr =
+		 case inet:port(Socket) of
+		     {ok, PortNo} when (IpPort =/= PortNo) ->
+			 lists:flatten(io_lib:format("~p (~w)", [IpPort, PortNo]));
+		     _ ->
+			 lists:flatten(io_lib:format("~p", [IpPort]))
+		 end,
              ?vtrace("socket created: "
-                     "~n      Ip Port:     ~p"
+                     "~n      Ip Port:     ~s"
                      "~n      Socket Opts: ~p"
-                     "~n      Socket:      ~p", [IpPort, SocketOpts, Socket]),
+                     "~n      Socket:      ~p", [PortInfoStr, SocketOpts, Socket]),
 	     #transport{socket       = Socket,
                         port_info    = IpPort,
                         opts         = SocketOpts,
@@ -340,13 +362,17 @@ socket_open(IpPort, SocketOpts) ->
 	    "~n      IpPort:     ~p"
 	    "~n      SocketOpts: ~p", [IpPort, SocketOpts]),
     case gen_udp:open(IpPort, SocketOpts) of
-	{error, _} = Error ->
+	{error, _Reason} = Error ->
+	    ?vlog("socket_open -> entry with"
+		  "~n      Options: ~p"
+		  "~n      Reason:  ~p", [SocketOpts, _Reason]),
 	    throw(Error);
 	{ok, Socket} ->
 	    Socket
     end.
 
-socket_params(Domain, {IpAddr, IpPort} = Addr, BindTo, CommonSocketOpts) ->
+socket_params(Domain, {IpAddr, IpPort} = Addr,
+	      RequireBind, BindTo, CommonSocketOpts) ->
     Family = snmp_conf:tdomain_to_family(Domain),
     SocketOpts =
 	case Family of
@@ -360,22 +386,22 @@ socket_params(Domain, {IpAddr, IpPort} = Addr, BindTo, CommonSocketOpts) ->
 	    case init:get_argument(snmpm_fd) of
 		{ok, [[FdStr]]} ->
 		    Fd = list_to_integer(FdStr),
-		    case BindTo of
+		    case RequireBind orelse BindTo of
 			true ->
 			    {IpPort, [{ip, IpAddr}, {fd, Fd} | SocketOpts]};
 			_ ->
 			    {0, [{fd, Fd} | SocketOpts]}
 		    end;
 		error ->
-		    socket_params(SocketOpts, Addr, BindTo)
+		    socket_params(SocketOpts, Addr, RequireBind, BindTo)
 	    end;
 	_ ->
-	    socket_params(SocketOpts, Addr, BindTo)
+	    socket_params(SocketOpts, Addr, RequireBind, BindTo)
     end.
 
 %%
-socket_params(SocketOpts, {IpAddr, IpPort}, BindTo) ->
-    case BindTo of
+socket_params(SocketOpts, {IpAddr, IpPort}, RequireBind, BindTo) ->
+    case RequireBind orelse BindTo of
 	true ->
 	    {IpPort, [{ip, IpAddr} | SocketOpts]};
 	_ ->
@@ -593,7 +619,8 @@ handle_cast(filter_reset, State) ->
     {noreply, State};
 
 %% This is for debugging!!
-handle_cast({exec, F}, #state{allow_exec = true} = State) when is_function(F, 0) ->
+handle_cast({exec, F}, #state{allow_exec = true} = State)
+  when is_function(F, 0) ->
     ?vlog("[cast] exec", []),
     F(),
     {noreply, State};
@@ -616,8 +643,8 @@ handle_info(
     Size = byte_size(Bytes),
     case lists:keyfind(Socket, #transport.socket, Transports) of
 	#transport{socket = Socket, domain = Domain} ->
-	    ?vlog("received ~w bytes from ~p:~p [~w]",
-		  [Size, IpAddr, IpPort, Socket]),
+	    ?vlog("received ~w bytes from [~w] ~p:~p (~w)",
+		  [Size, Domain, IpAddr, IpPort, Socket]),
 	    maybe_handle_recv_msg(Domain, {IpAddr, IpPort}, Bytes, State),
 	    {noreply, State};
 	false ->
@@ -740,8 +767,18 @@ handle_info_down(Info, State) ->
 %% Purpose: Shutdown the server
 %% Returns: any (ignored by gen_server)
 %%--------------------------------------------------------------------
-terminate(Reason, #state{log = Log, irgc = IrGcRef}) ->
+terminate(Reason, #state{log        = Log,
+                         irgc       = IrGcRef,
+                         transports = Transports}) ->
     ?vdebug("terminate: ~p", [Reason]),
+    %% Close all transports:
+    Close =
+        fun(S) ->
+                ?vlog("try close socket ~p", [S]),
+                (catch gen_udp:close(S))
+        end,
+    _ = [Close(Socket) || #transport{socket = Socket} <- Transports],
+    %% Stop IR GC timer
     irgc_stop(IrGcRef),
     %% Close logs
     do_close_log(Log),
@@ -772,7 +809,7 @@ maybe_handle_recv_msg(Domain, Addr, Bytes, State) ->
        fun (Pid, Class, Reason, Stacktrace) ->
 	       warning_msg(
 		 "Worker process (~p) terminated "
-		 "while processing (incomming) message from %s:~n"
+		 "while processing (incoming) message from %s:~n"
 		 "~w:~w at ~p",
 		 [Pid, snmp_conf:mk_addr_string({Domain, Addr}),
 		  Class, Reason, Stacktrace])
@@ -794,7 +831,7 @@ maybe_handle_recv_msg_mt(
     
 
 handle_recv_msg(Domain, Addr, Bytes, #state{server = Pid})
-  when is_binary(Bytes) andalso (size(Bytes) =:= 0) ->
+  when is_binary(Bytes) andalso (byte_size(Bytes) =:= 0) ->
     Pid ! {snmp_error, {empty_message, Domain, Addr}, Domain, Addr};
 %%
 handle_recv_msg(

@@ -1,5 +1,12 @@
 %% -*- erlang-indent-level: 2 -*-
 %%
+%% %CopyrightBegin%
+%%
+%% SPDX-License-Identifier: Apache-2.0
+%%
+%% Copyright 2004-2010 held by the authors. All Rights Reserved.
+%% Copyright Ericsson AB 2009-2026. All Rights Reserved.
+%%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
 %% You may obtain a copy of the License at
@@ -11,6 +18,8 @@
 %% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 %% See the License for the specific language governing permissions and
 %% limitations under the License.
+%%
+%% %CopyrightEnd%
 
 %%%-------------------------------------------------------------------
 %%% File    : dialyzer_typesig.erl
@@ -21,6 +30,9 @@
 %%%-------------------------------------------------------------------
 
 -module(dialyzer_typesig).
+-moduledoc false.
+
+-compile([{nowarn_possibly_unsafe_function, {erlang, list_to_atom, 1}}]).
 
 -export([analyze_scc/7]).
 -export([get_safe_underapprox/2]).
@@ -42,13 +54,13 @@
 	 t_is_float/1, t_is_fun/1,
 	 t_is_integer/1, t_non_neg_integer/0,
 	 t_is_list/1, t_is_nil/1, t_is_none/1, t_is_number/1,
-	 t_is_singleton/1, t_is_none_or_unit/1,
+	 t_is_singleton/1, t_is_impossible/1,
 
          t_limit/2, t_list/0, t_list/1,
 	 t_list_elements/1, t_nonempty_list/1, t_maybe_improper_list/0,
 	 t_module/0, t_number/0, t_number_vals/1,
 	 t_pid/0, t_port/0, t_product/1, t_reference/0,
-	 t_subst/2,
+	 t_record/0, t_subst/2,
 	 t_timeout/0, t_tuple/0, t_tuple/1,
          t_var/1, t_var_name/1,
 	 t_none/0, t_unit/0,
@@ -133,8 +145,10 @@
 %%-define(DEBUG_CONSTRAINTS, true).
 -ifdef(DEBUG).
 -define(DEBUG_NAME_MAP, true).
+-define(DEBUG_LOOP_DETECTION, true).
 -endif.
 %%-define(DEBUG_NAME_MAP, true).
+%%-define(DEBUG_LOOP_DETECTION, true).
 
 -ifdef(DEBUG).
 -define(debug(__String, __Args), io:format(__String, __Args)).
@@ -179,7 +193,7 @@ analyze_scc(SCC, NextLabel, CallGraph, CServer, Plt, PropTypes, Solvers0) ->
   Solvers = solvers(Solvers0),
   State1 = new_state(SCC, NextLabel, CallGraph, CServer, Plt, PropTypes,
                      Solvers),
-  DefSet = add_def_list(maps:values(State1#state.name_map), sets:new([{version, 2}])),
+  DefSet = add_def_list(maps:values(State1#state.name_map), sets:new()),
   State2 = traverse_scc(SCC, CServer, DefSet, State1),
   State3 = state__finalize(State2),
   Funs = state__scc(State3),
@@ -253,17 +267,24 @@ traverse(Tree, DefinedVars, State) ->
       {State1, [SizeType, ValType]} =
 	traverse_list([Size, Val], DefinedVars, State),
       {State2, TypeConstr, BinValTypeConstr} =
-	case cerl:bitstr_bitsize(Tree) of
-	  all ->
-            T = t_bitstr(UnitVal, 0),
-            {State1, T, T};
-	  utf ->
-            %% contains an integer number of bytes
-            T = t_binary(),
-            {State1, T, T};
-	  N when is_integer(N) ->
-            {State1, t_bitstr(0, N), t_bitstr(1, N)};
-	  any -> % Size is not a literal
+        case cerl:is_literal(Size) of
+          true ->
+            case cerl:concrete(Size) of
+              all ->
+                T = t_bitstr(UnitVal, 0),
+                {State1, T, T};
+              undefined ->      %utf-8/16/32
+                %% contains an integer number of bytes
+                T = t_binary(),
+                {State1, T, T};
+              N0 when is_integer(N0) ->
+                N = N0 * UnitVal,
+                {State1, t_bitstr(0, N), t_bitstr(1, N)};
+              _ ->
+                {State1, t_none(), t_none()}
+            end;
+          false ->
+            %% Size is not a literal
             T1 = ?mk_fun_var(bitstr_constr(SizeType, UnitVal), [SizeType]),
             T2 =
               ?mk_fun_var(bitstr_constr(SizeType, UnitVal, match), [SizeType]),
@@ -426,7 +447,17 @@ traverse(Tree, DefinedVars, State) ->
           end;
         remove_message ->
           {State, t_any()};
-        timeout ->
+        nif_start ->
+          {State, t_any()};
+        debug_line ->
+          {State, t_any()};
+        executable_line ->
+          {State, t_any()};
+        record_field ->
+          {State, t_any()};
+        is_native_record ->
+          {State, t_any()};
+        is_record_accessible ->
           {State, t_any()};
 	Other -> erlang:error({'Unsupported primop', Other})
       end;
@@ -462,21 +493,19 @@ traverse(Tree, DefinedVars, State) ->
 	    {NewEvars, TmpState} = lists:mapfoldl(Fun, State1, EVars),
 	    {TmpState, t_tuple(NewEvars)}
 	end,
-      case Elements of
-	[Tag|Fields] ->
-	  case cerl:is_c_atom(Tag) andalso is_literal_record(Tree) of
-	    true ->
-              %% Check if a record is constructed.
-              Arity = length(Fields),
-              case lookup_record(State2, cerl:atom_val(Tag), Arity) of
-                {error, State3} -> {State3, TupleType};
-                {ok, RecType, State3} ->
-                  State4 = state__store_conj(TupleType, sub, RecType, State3),
-                  {State4, TupleType}
-              end;
-	    false -> {State2, TupleType}
-          end;
-	[] -> {State2, TupleType}
+      maybe
+	[Tag|Fields] ?= Elements,
+        true ?= cerl:is_c_atom(Tag) andalso is_literal_record(Tree),
+        %% Check if a record is constructed.
+        Arity = length(Fields),
+        case lookup_record(State2, cerl:atom_val(Tag), Arity) of
+          {error, State3} -> {State3, TupleType};
+          {ok, RecType, State3} ->
+            State4 = state__store_conj(TupleType, sub, RecType, State3),
+            {State4, TupleType}
+        end
+      else
+	_ -> {State2, TupleType}
       end;
     map ->
       Entries = cerl:map_es(Tree),
@@ -525,14 +554,14 @@ traverse(Tree, DefinedVars, State) ->
 		    false -> t_any();
 		    true ->
 		      MT = t_inf(lookup_type(MapVar, Map), t_map()),
-		      case t_is_none_or_unit(MT) of
+		      case t_is_impossible(MT) of
 			true -> t_none();
 			false ->
 			  DisjointFromKeyType =
 			    fun(ShadowKey) ->
                                 ST = t_inf(lookup_type(ShadowKey, Map),
                                            KeyType),
-				t_is_none_or_unit(ST)
+				t_is_impossible(ST)
 			    end,
 			  case lists:all(DisjointFromKeyType, ShadowKeys) of
 			    true -> t_map_get(KeyType, MT);
@@ -566,7 +595,7 @@ traverse(Tree, DefinedVars, State) ->
 			    cerl:concrete(OpTree) =:= exact of
 			    true ->
                               ST = t_inf(ShadowedKeys, KeyType),
-                              case t_is_none_or_unit(ST) of
+                              case t_is_impossible(ST) of
 				true ->
 				  t_map_put({KeyType, t_any()}, AccType);
 				false ->
@@ -586,6 +615,11 @@ traverse(Tree, DefinedVars, State) ->
 	    state__store_conj(ArgVar, sub, ArgType, State3)
 	end,
       {state__store_conj(MapVar, sub, MapType, State4), MapVar};
+    record ->
+      Es = cerl:record_es(Tree),
+      Vals = [cerl:record_pair_val(P) || P <- Es],
+      {State1, _ValVars} = traverse_list(Vals, DefinedVars, State),
+      {State1, mk_var(Tree)};
     values ->
       %% We can get into trouble when unifying products that have the
       %% same element appearing several times. Handle these cases by
@@ -808,13 +842,13 @@ get_plt_constr(MFA, Dst, ArgVars, State) ->
 			 end, ArgVars), GenArgs};
 	  {value, {PltRetType, PltArgTypes}} ->
 	    %% Need to combine the contract with the success typing.
-	    {?mk_fun_var(
-		fun(Map) ->
-		    ArgTypes = lookup_type_list(ArgVars, Map),
+            {?mk_fun_var(
+                fun(Map) ->
+                    ArgTypes = lookup_type_list(ArgVars, Map),
                     CRet = get_contract_return(C, ArgTypes),
-		    t_inf(CRet, PltRetType)
-		end, ArgVars),
-	     [t_inf(X, Y) || {X, Y} <- lists:zip(GenArgs, PltArgTypes)]}
+                    t_inf(CRet, PltRetType)
+                end, ArgVars),
+             [t_inf(X, Y) || X <- GenArgs && Y <- PltArgTypes]}
 	end,
       state__store_conj_lists([Dst|ArgVars], sub, [RetType|ArgCs], State)
   end.
@@ -1021,8 +1055,6 @@ get_type_test({erlang, is_map, 1}) ->       {ok, t_map()};
 get_type_test({erlang, is_number, 1}) ->    {ok, t_number()};
 get_type_test({erlang, is_pid, 1}) ->       {ok, t_pid()};
 get_type_test({erlang, is_port, 1}) ->      {ok, t_port()};
-%% get_type_test({erlang, is_record, 2}) ->    {ok, t_tuple()};
-%% get_type_test({erlang, is_record, 3}) ->    {ok, t_tuple()};
 get_type_test({erlang, is_reference, 1}) -> {ok, t_reference()};
 get_type_test({erlang, is_tuple, 1}) ->     {ok, t_tuple()};
 get_type_test({M, F, A}) when is_atom(M), is_atom(F), is_integer(A) -> error.
@@ -1038,7 +1070,8 @@ bitstr_constr(SizeType, UnitVal, ConstructOrMatch) ->
     end,
   fun(Map) ->
       TmpSizeType = lookup_type(SizeType, Map),
-      case t_is_subtype(TmpSizeType, t_non_neg_integer()) of
+      case t_is_integer(TmpSizeType) andalso
+        t_is_subtype(TmpSizeType, t_non_neg_integer()) of
 	true ->
 	  case t_number_vals(TmpSizeType) of
 	    [OneSize] -> t_bitstr(Unit, OneSize * UnitVal);
@@ -1054,7 +1087,8 @@ bitstr_constr(SizeType, UnitVal, ConstructOrMatch) ->
 bitstr_val_constr(SizeType, UnitVal, Flags) ->
   fun(Map) ->
       TmpSizeType = lookup_type(SizeType, Map),
-      case t_is_subtype(TmpSizeType, t_non_neg_integer()) of
+      case t_is_integer(TmpSizeType) andalso
+        t_is_subtype(TmpSizeType, t_non_neg_integer()) of
 	true ->
 	  case erl_types:number_max(TmpSizeType) of
 	    N when is_integer(N), N < 128 -> %% Avoid illegal arithmetic
@@ -1114,6 +1148,8 @@ get_safe_underapprox_1([Pat0|Left], Acc, Map) ->
 	OtherPat ->
 	  get_safe_underapprox_1([OtherPat|Left], Acc, Map)
       end;
+    record ->
+      throw(dont_know);
     tuple ->
       Es = cerl:tuple_es(Pat),
       {Ts, Map1} = get_safe_underapprox_1(Es, [], Map),
@@ -1123,7 +1159,8 @@ get_safe_underapprox_1([Pat0|Left], Acc, Map) ->
       %% Some assertions in case the syntax gets more premissive in the future
       true = #{} =:= cerl:concrete(cerl:map_arg(Pat)),
       true = lists:all(fun(P) ->
-			   cerl:is_literal(Op = cerl:map_pair_op(P)) andalso
+                           Op = cerl:map_pair_op(P),
+			   cerl:is_literal(Op) andalso
 			     exact =:= cerl:concrete(Op)
 		       end, cerl:map_es(Pat)),
       KeyTrees = lists:map(fun cerl:map_pair_key/1, cerl:map_es(Pat)),
@@ -1139,7 +1176,8 @@ get_safe_underapprox_1([Pat0|Left], Acc, Map) ->
       %% We need to deal with duplicates ourselves
       SquashDuplicates =
 	fun SquashDuplicates([{K,First},{K,Second}|List]) ->
-	    case t_is_none(Inf = t_inf(First, Second)) of
+            Inf = t_inf(First, Second),
+	    case t_is_none(Inf) of
 	      true -> throw(dont_know);
 	      false -> [{K, Inf}|SquashDuplicates(List)]
 	    end;
@@ -1167,7 +1205,8 @@ get_safe_overapprox(Pats) ->
   lists:map(fun get_safe_overapprox_1/1, Pats).
 
 get_safe_overapprox_1(Pat) ->
-  case cerl:is_literal(Lit = cerl:fold_literal(Pat)) of
+  Lit = cerl:fold_literal(Pat),
+  case cerl:is_literal(Lit) of
     true  -> t_from_term(cerl:concrete(Lit));
     false -> t_any()
   end.
@@ -1384,8 +1423,8 @@ get_bif_constr({erlang, is_reference, 1}, Dst, [Arg], State) ->
 get_bif_constr({erlang, is_record, 2}, Dst, [Var, Tag] = Args, _State) ->
   ArgFun = fun(Map) ->
 	       case t_is_any_atom(true, lookup_type(Dst, Map)) of
-		 true -> t_tuple();
-		 false -> t_any()
+                 true -> t_sup(t_tuple(), t_record());
+                 false -> t_any()
 	       end
 	   end,
   ArgV = ?mk_fun_var(ArgFun, [Dst]),
@@ -1398,7 +1437,6 @@ get_bif_constr({erlang, is_record, 2}, Dst, [Var, Tag] = Args, _State) ->
 			   mk_constraint(Tag, sub, t_atom()),
 			   mk_constraint(Var, sub, ArgV)]);
 get_bif_constr({erlang, is_record, 3}, Dst, [Var, Tag, Arity] = Args, State) ->
-  %% TODO: Revise this to make it precise for Tag and Arity.
   ArgFun =
     fun(Map) ->
 	case t_is_any_atom(true, lookup_type(Dst, Map)) of
@@ -1426,7 +1464,7 @@ get_bif_constr({erlang, is_record, 3}, Dst, [Var, Tag, Arity] = Args, State) ->
 		    end;
 		  _ -> t_tuple()
 		end;
-	      false -> t_tuple()
+	      false -> t_sup(t_tuple(), t_record())
 	    end;
 	  false -> t_any()
 	end
@@ -1438,10 +1476,20 @@ get_bif_constr({erlang, is_record, 3}, Dst, [Var, Tag, Arity] = Args, State) ->
 	       bif_return(erlang, is_record, 3, TmpArgTypes)
 	   end,
   DstV = ?mk_fun_var(DstFun, Args),
-  mk_conj_constraint_list([mk_constraint(Dst, sub, DstV),
-			   mk_constraint(Arity, sub, t_integer()),
-			   mk_constraint(Tag, sub, t_atom()),
-			   mk_constraint(Var, sub, ArgV)]);
+  case {t_is_atom(Arity),t_is_integer(Arity)} of
+    {false, true} ->
+      %% Tuple record
+      mk_conj_constraint_list([mk_constraint(Dst, sub, DstV),
+                               mk_constraint(Arity, sub, t_integer()),
+                               mk_constraint(Tag, sub, t_atom()),
+                               mk_constraint(Var, sub, ArgV)]);
+    {true, false} ->
+      %% Native record
+      mk_conj_constraint_list([mk_constraint(Var, sub, t_record()),
+                               mk_constraint(Tag, sub, t_atom())]);
+    {_, _} ->
+      mk_constraint_any(sub)
+  end;
 get_bif_constr({erlang, is_tuple, 1}, Dst, [Arg], State) ->
   get_bif_test_constr(Dst, Arg, t_tuple(), State);
 get_bif_constr({erlang, 'and', 2}, Dst, [Arg1, Arg2] = Args, _State) ->
@@ -1832,23 +1880,19 @@ scc_fold_fun(F, FunMap, State) ->
                                                     format_type(NewType)]),
   NewFunMap.
 
+solve(Fun, FunMap, State) ->
+  {ok, Map} = v2_solve_ref(Fun, FunMap, State),
+  Map.
+
 %% Solver v2
 
 -record(v2_state, {constr_data = maps:new() :: map(),
 		   state :: state()}).
 
-solve(Fun, FunMap, State) ->
+v2_solve_ref(Fun, Map, State) ->
   V2State = #v2_state{state = State},
-  try v2_solve_reference(Fun, FunMap, V2State) of
-    {ok, NewMap, _, _} -> NewMap
-  catch
-    throw:infinite_loop:Stack ->
-        erlang:raise(error,
-                     {"Infinite loop detected, please report this bug.",
-                      Fun,
-                      State#state.module},
-                     Stack)
-  end.
+  {ok, NewMap, _, _} = v2_solve_reference(Fun, Map, V2State),
+  {ok, NewMap}.
 
 v2_solve(#constraint{}=C, Map, V2State) ->
   case solve_one_c(C, Map) of
@@ -1888,20 +1932,22 @@ v2_solve_reference(Id, Map, V2State0) ->
             {ok, Dom} -> t_fun(Dom, t_none())
           end,
         {FunType0, V2State1};
-      {ok, NewMap, V2State1, U} ->
+      {ok, ResMap, V2State1, ResU} ->
         ?debug("Done solving fun: ~tp\n", [debug_lookup_name(Id)]),
-        FunType0 = lookup_type(Id, NewMap),
-        V2State2 = save_local_map(V2State1, Id, U, NewMap),
+        FunType0 = lookup_type(Id, ResMap),
+        V2State2 = save_local_map(V2State1, Id, ResU, ResMap),
         {FunType0, V2State2}
     end,
   ?debug("ref Id=~w Assigned ~ts\n", [Id, format_type(FunType)]),
-  {NewMap1, U1} = enter_var_type(Id, FunType, Map),
-  {NewMap2, U2} =
-    case state__get_rec_var(Id, State) of
-      {ok, Var} -> enter_var_type(Var, FunType, NewMap1);
-      error -> {NewMap1, []}
-    end,
-  {ok, NewMap2, V2State, lists:umerge(U1, U2)}.
+  {NewMap0, U0} = enter_var_type(Id, FunType, Map),
+  case state__get_rec_var(Id, State) of
+    {ok, Var} ->
+      %% `Id` and `Var` are one and the same, so they need to be unified.
+      {ok, {NewMap, U}} = refine_bindings([{Var, FunType}], NewMap0, U0),
+      {ok, NewMap, V2State, U};
+    error ->
+      {ok, NewMap0, V2State, U0}
+  end.
 
 v2_solve_self_recursive(Cs, Map, Id, RecType0, V2State0) ->
   ?debug("Solving self recursive ~tw\n", [debug_lookup_name(Id)]),
@@ -2089,10 +2135,10 @@ v2_solve_conj([], _Cs, _I, Map, Conj, IsFlat, V2State, UL, NewFs, VarsUp,
       ?debug("conjunct finished Id=~w\n", [Conj#constraint_list.id]),
       {ok, Map, V2State, lists:umerge([U|VarsUp])};
     NewFlags when NewFlags =:= LastFlags, Map =:= LastMap ->
-      %% We're stuck in an infinite loop, so we'll crash in the hopes of
-      %% getting a report. Trying to return anyway will yield potentially
-      %% misleading results.
-      throw(infinite_loop);
+      %% A loop was detected! The cause is some bug, possibly in erl_types.
+      %% The evaluation continues, but the results can be wrong.
+      report_detected_loop(Conj),
+      {ok, Map, V2State, lists:umerge([U|VarsUp])};
     NewFlags ->
       ?debug("conjunct restart Id=~w\n", [Conj#constraint_list.id]),
       #constraint_list{type = conj, list = Cs} = Conj,
@@ -2111,6 +2157,14 @@ v2_solve_conj(Is, [_|Tail], I, Map, Conj, IsFlat, V2State, UL, NewFs, VarsUp,
              LastMap, LastFlags) ->
   v2_solve_conj(Is, Tail, I+1, Map, Conj, IsFlat, V2State, UL, NewFs, VarsUp,
                LastMap, LastFlags).
+
+-ifdef(DEBUG_LOOP_DETECTION).
+report_detected_loop(Conj) ->
+  io:format("A loop was detected in ~w\n", [Conj#constraint_list.id]).
+-else.
+report_detected_loop(_) ->
+  ok.
+-endif.
 
 add_mask_to_flags(Flags, [Im|M], I, L) when I > Im ->
   add_mask_to_flags(Flags, M, I, [Im|L]);
@@ -2249,8 +2303,7 @@ solve_subtype(Type, Inf, Map) ->
 %% Similar to enter_type/3 over a list, but refines known types rather than
 %% replaces them.
 refine_bindings([{Key, Val} | Tail], Map, U0) ->
-  ?debug("Unifying ~ts :: ~ts\n",
-         [format_type(t_var(Key)), format_type(Val)]),
+  ?debug("Unifying ~p :: ~ts\n", [Key, format_type(Val)]),
   %% It's important to keep opaque types whose internal structure is any(),
   %% hence the equality check on t_any() rather than t_is_any/1.
   case t_is_equal(Val, t_any()) of
@@ -2375,20 +2428,15 @@ unsafe_lookup_type(Key, Map) ->
 unsafe_lookup_type_list(List, Map) ->
   [unsafe_lookup_type(X, Map) || X <- List].
 
-lookup_type(Key, Map) when is_integer(Key) ->
-  case maps:find(Key, Map) of
-    error -> t_any();
-    {ok, Val} -> Val
-  end;
 lookup_type(#fun_var{'fun' = Fun}, Map) ->
   Fun(Map);
+lookup_type(Key, Map) when is_integer(Key) ->
+  case Map of
+    #{Key := Val} -> Val;
+    #{} -> t_any()
+  end;
 lookup_type(Key, Map) ->
-  %% Seems unused and dialyzer complains about it -- commented out.
-  %% case cerl:is_literal(Key) of
-  %%   true -> t_from_term(cerl:concrete(Key));
-  %%   false ->
   t_subst(Key, Map).
-  %% end.
 
 mk_var(Var) ->
   case cerl:is_literal(Var) of
@@ -2628,8 +2676,7 @@ state__store_funs(Vars0, Funs0, #state{fun_map = Map} = State) ->
   debug_make_name_map(Vars0, Funs0),
   Vars = mk_var_list(Vars0),
   Funs = mk_var_list(Funs0),
-  NewMap = lists:foldl(fun({Var, Fun}, MP) -> maps:put(Fun, Var, MP) end,
-		       Map, lists:zip(Vars, Funs)),
+  NewMap = maps:merge(Map, #{Fun => Var || Var <- Vars && Fun <- Funs}),
   State#state{fun_map = NewMap}.
 
 state__get_rec_var(Fun, #state{fun_map = Map}) ->
@@ -3080,9 +3127,8 @@ lookup_record(State, Tag, Arity) ->
     end,
   case erl_types:lookup_record(Tag, Arity, Rec) of
     {ok, Fields} ->
-      RecType =
-        t_tuple([t_from_term(Tag)|
-                 [FieldType || {_FieldName, _Abstr, FieldType} <- Fields]]),
+      RecType = t_tuple([t_from_term(Tag)|
+                            [FieldType || {_FieldName, _Abstr, FieldType} <- Fields]]),
       {ok, RecType, State1};
     error ->
       {error, State1}
@@ -3155,7 +3201,7 @@ pp_constrs_scc(SCC, State) ->
   [pp_constrs(Fun, state__get_cs(Fun, State), State) || Fun <- SCC].
 
 pp_constrs(Fun, Cs, State) ->
-  io:format("Constraints for fun: ~tw", [debug_lookup_name(Fun)]),
+  io:format("Constraints for fun: ~tw~n", [debug_lookup_name(Fun)]),
   MaxDepth = pp_constraints(Cs, State),
   io:format("Depth: ~w\n", [MaxDepth]).
 

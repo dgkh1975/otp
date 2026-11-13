@@ -1,7 +1,9 @@
 %%
 %% %CopyrightBegin%
 %%
-%% Copyright Ericsson AB 2011-2017. All Rights Reserved.
+%% SPDX-License-Identifier: Apache-2.0
+%%
+%% Copyright Ericsson AB 2011-2025. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -47,7 +49,7 @@
 %%      {title, Title}
 %%      {dnQualifer, DnQ}
 %%   issuer = {Issuer, IssuerKey}                   true (i.e. a ca cert is created) 
-%%                                                  (obs IssuerKey migth be {Key, Password}
+%%                                                  (obs IssuerKey might be {Key, Password}
 %%   key = KeyFile|KeyBin|rsa|dsa|ec                Subject PublicKey rsa, dsa or ec generates key
 %%   
 %%
@@ -162,16 +164,16 @@ decode_key(PemBin, Pw) ->
     decode_key(KeyInfo, Pw).
 
 encode_key(Key = #'RSAPrivateKey'{}) ->
-    {ok, Der} = 'OTP-PUB-KEY':encode('RSAPrivateKey', Key),
+    {ok, Der} = 'PKCS-1':encode('RSAPrivateKey', Key),
     {'RSAPrivateKey', Der, not_encrypted};
 encode_key(Key = {#'RSAPrivateKey'{},#'RSASSA-PSS-params'{}}) ->
     Der = public_key:der_encode('PrivateKeyInfo', Key),
     {'PrivateKeyInfo', Der, not_encrypted};
 encode_key(Key = #'DSAPrivateKey'{}) ->
-    {ok, Der} = 'OTP-PUB-KEY':encode('DSAPrivateKey', Key),
+    {ok, Der} = 'DSS':encode('DSAPrivateKey', Key),
     {'DSAPrivateKey', Der, not_encrypted};
 encode_key(Key = #'ECPrivateKey'{}) ->
-    {ok, Der} = 'OTP-PUB-KEY':encode('ECPrivateKey', Key),
+    {ok, Der} = 'ECPrivateKey':encode('ECPrivateKey', Key),
     {'ECPrivateKey', Der, not_encrypted}.
 
 make_tbs(SubjectKey, Opts) ->    
@@ -340,7 +342,7 @@ sign_algorithm(#'RSAPrivateKey'{}, Opts) ->
 	       md2    -> ?'md2WithRSAEncryption'
 	   end,
     {Type, 'NULL'};
-sign_algorithm({#'RSAPrivateKey'{},#'RSASSA-PSS-params'{}=P}, Opts) ->
+sign_algorithm({#'RSAPrivateKey'{},#'RSASSA-PSS-params'{}=P}, _Opts) ->
     {?'id-RSASSA-PSS', P};
 sign_algorithm(#'DSAPrivateKey'{p=P, q=Q, g=G}, _Opts) ->
     {?'id-dsa-with-sha1', {params,#'Dss-Parms'{p=P, q=Q, g=G}}};
@@ -368,7 +370,7 @@ make_key(ec, _Opts) ->
 
 gen_rsa2(Size) -> 
     try
-        %% The numbers 2048,17 is choosen to not cause the cryptolib on
+        %% The numbers 2048,17 is chosen to not cause the cryptolib on
         %% FIPS-enabled test machines be mad at us.
         public_key:generate_key({rsa, 2048, 17})
     catch

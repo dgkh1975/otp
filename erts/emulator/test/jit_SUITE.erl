@@ -1,7 +1,9 @@
 %%
 %% %CopyrightBegin%
 %%
-%% Copyright Ericsson AB 2021-2021. All Rights Reserved.
+%% SPDX-License-Identifier: Apache-2.0
+%%
+%% Copyright Ericsson AB 2021-2025. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -24,16 +26,19 @@
          init_per_suite/1, end_per_suite/1,
          init_per_group/2, end_per_group/2,
          init_per_testcase/2, end_per_testcase/2]).
--export([annotate/1, named_labels/1, symbols/1]).
+-export([annotate/1, frame_pointers/1, jmsingle/1, named_labels/1,
+         symbols/1, perfdirectory_set/1, perfdirectory_not_set/1]).
+-export([frame_pointer_workload/0]).
 
 suite() ->
     [{timetrap, {minutes, 4}}].
 
 groups() ->
-    [{perf, [symbols, annotate]}].
+    [{perf, [symbols, annotate, frame_pointers,
+             perfdirectory_set, perfdirectory_not_set]}].
 
 all() ->
-    [{group, perf}, named_labels].
+    [{group, perf}, jmsingle, named_labels].
 
 init_per_suite(Config) ->
     case erlang:system_info(emu_flavor) of
@@ -52,11 +57,13 @@ init_per_group(perf, Config) ->
             {skip, "perf not found"};
         _Perf ->
             PerfVsn = os:cmd("perf version"),
-            case re:run(PerfVsn, "perf version ([^.])",
+            case re:run(PerfVsn, "perf version (\\d+)\\.(\\d+)",
                         [{capture,all_but_first,list}]) of
-                {match,[Vsn]} ->
-                    case list_to_integer(Vsn) >= 5 of
-                        true ->
+                {match,[Major0,Minor0]} ->
+                    Major = list_to_integer(Major0),
+                    Minor = list_to_integer(Minor0),
+                    if
+                        Major > 5; Major =:= 5, Minor >= 11 ->
                             BuildIdDir = "--buildid-dir " ++
                                 filename:join(
                                   proplists:get_value(priv_dir, Config),
@@ -75,7 +82,7 @@ init_per_group(perf, Config) ->
                                 nomatch ->
                                     {skip, "could not run `"++ Cmd ++"`"}
                             end;
-                        false ->
+                        true ->
                             {skip,"too old perf version: " ++ PerfVsn}
                     end;
                 _ ->
@@ -102,6 +109,13 @@ end_per_group(perf, Config) ->
 end_per_group(_, _Config) ->
     ok.
 
+init_per_testcase(frame_pointers, Config) ->
+    case erlang:system_info(system_architecture) of
+        "aarch64" ++ _ ->
+            Config;
+        _ ->
+            {skip, "AArch64-specific test"}
+    end;
 init_per_testcase(named_labels, Config) ->
     %% Only run named_labels on platforms where we know it works.
     case erlang:system_info(system_architecture) of
@@ -145,6 +159,50 @@ symbols(Config) ->
         nomatch ->
             ct:fail("Did not find lists:seq symbol in:~n~ts",[Script])
     end.
+
+frame_pointers(Config) ->
+    BuildIdDir = proplists:get_value(buildiddir, Config),
+    DataFile = filename:join(
+                 proplists:get_value(priv_dir, Config),
+                 atom_to_list(?FUNCTION_NAME) ++ ".data"),
+    ModulePath = filename:dirname(code:which(?MODULE)),
+    Cmd = "perf " ++ BuildIdDir ++ " record -q -F 99 -g " ++
+        "--call-graph fp -o " ++ DataFile ++ " " ++
+        "erl +S 1 +JPperf map -noshell -pa " ++ ModulePath ++ " " ++
+        "-s jit_SUITE frame_pointer_workload -s init stop",
+    "" = os:cmd(Cmd),
+    Script = os:cmd("perf " ++ BuildIdDir ++ " script -i " ++ DataFile),
+    Samples = string:split(Script, "\n\n", all),
+    Depths = [length(Matches) || Sample <- Samples,
+               {match, Matches} <-
+                   [re:run(Sample, "\\$jit_SUITE:frame_pointer_[abc]/1",
+                           [global, {capture, first, list}])]],
+    case Depths =/= [] andalso lists:max(Depths) >= 8 of
+        true ->
+            ok;
+        false ->
+            ct:fail("Did not find a deep Erlang call chain")
+    end.
+
+frame_pointer_workload() ->
+    End = erlang:monotonic_time(millisecond) + 2000,
+    frame_pointer_repeat(End).
+
+frame_pointer_repeat(End) ->
+    _ = frame_pointer_a(32),
+    case erlang:monotonic_time(millisecond) < End of
+        true -> frame_pointer_repeat(End);
+        false -> ok
+    end.
+
+frame_pointer_a(0) -> 1;
+frame_pointer_a(N) -> 1 + frame_pointer_b(N - 1).
+
+frame_pointer_b(0) -> 1;
+frame_pointer_b(N) -> 1 + frame_pointer_c(N - 1).
+
+frame_pointer_c(0) -> 1;
+frame_pointer_c(N) -> 1 + frame_pointer_a(N - 1).
     
 annotate(Config) ->
     BuildIdDir = proplists:get_value(buildiddir, Config),
@@ -157,21 +215,82 @@ annotate(Config) ->
 
     %% When doing "perf inject" the symbol of each function is changed
     %% from $lists:seq_loop/3 to lists:seq_loop/3. I don't know why that
-    %% is, seems like a very odd bug in perf... so we only include it
-    %% in our match if it exists
-    {match, Symbols} = re:run(Script, "\\$?lists:seq[^/]+/[0-9]+",
+    %% is, seems like a very odd bug in perf...
+    {match, Symbols} = re:run(Script, "lists:seq[^/]+/[0-9]+",
                               [global,{capture,first,list}]),
-    [Symbol|_] = lists:usort(Symbols),
+    [[Symbol]|_] = lists:usort(Symbols),
     JitFile = DataFile ++ ".jit.data",
-    "" = os:cmd("perf "++ BuildIdDir ++" inject -j -i " ++ DataFile ++ " -o " ++ JitFile),
+    "" = os:cmd("perf "++ BuildIdDir ++" inject --jit -i " ++ DataFile ++ " -o " ++ JitFile),
     Anno = os:cmd("perf "++ BuildIdDir ++" annotate --stdio -i " ++ JitFile ++ " " ++ Symbol ++ ""),
-    case re:run(Anno,"Disassembly of section .text:") of
+    case re:run(Anno,"Source code & Disassembly") of
         {match,_} ->
-            ok;
+            case re:run(Anno, "<" ++ Symbol ++ ">:") of
+                {match,_} ->
+                    ok;
+                nomatch ->
+                    ct:fail("Did not find instructions for ~ts.~n~ts",
+                            [Symbol, Anno])
+            end;
         nomatch ->
-            ct:log("Did not find disassembly test for ~ts.~n~ts",
-                   [Symbol, Anno])
+            ct:fail("Did not find disassembly for ~ts.~n~ts",
+                    [Symbol, Anno])
     end.
+
+run_jmsingle_test(Param, ExpectSuccess, ErrorMsg) ->
+    Cmd = "erl +JMsingle " ++ Param ++ " -noshell " ++
+        "-eval \"erlang:display(all_is_well),erlang:halt(0).\"",
+    Result = os:cmd(Cmd),
+    SuccessfulEmulatorStart =
+        case Result of
+            "all_is_well" ++ _ ->
+                true;
+            _ ->
+                Error = "Failed to allocate executable+writable memory",
+                case string:find(Result, Error) of
+                    nomatch -> false;
+                    _ -> internal_error
+                end
+        end,
+    case SuccessfulEmulatorStart of
+        ExpectSuccess ->
+            ok;
+        _ ->
+            ct:fail(ErrorMsg)
+    end.
+
+jmsingle(Config) ->
+    %% Smoke test to check that the emulator starts with the +JMsingle
+    %% true/false option and fails with a non-boolean, that is, we
+    %% parse the command line correctly.
+    case os:type() of
+        {_, BSD} when BSD =:= netbsd;
+                      BSD =:= openbsd ->
+            %% +JMsingle true might not work on these platforms, and dump core
+            %% because the emulator cannot be started.
+            %% 
+            %% Set the cwd to a temporary directory that we'll delete when the
+            %% test is done.
+            {ok, Cwd} = file:get_cwd(),
+            TestDir = filename:join(proplists:get_value(priv_dir, Config),
+                                    "jmsingle"),
+            ok = file:make_dir(TestDir),
+            try
+                ok = file:set_cwd(TestDir),
+                run_jmsingle_test("true", internal_error,
+                                  "Emulator did not print the correct diagnostic "
+                                  "(crashed?) with +JMsingle true")
+            after
+                file:set_cwd(Cwd),
+                file:del_dir_r(TestDir)
+            end;
+        {_, _} ->
+            run_jmsingle_test("true", true,
+                              "Emulator did not start with +JMsingle true")
+    end,
+    run_jmsingle_test("false", true,
+                      "Emulator did not start with +JMsingle false"),
+    run_jmsingle_test("broken", false,
+                      "Emulator started with bad +JMsingle parameter").
 
 get_tmp_asm_files() ->
     {ok, Cwd} = file:get_cwd(),
@@ -220,4 +339,27 @@ named_labels(_Config) ->
             end;
         _ ->
             ct:fail("No labels found in assembly dump")
+    end.
+
+perfdirectory_set(_Config) ->
+    %% Confirm that when +JPperfdirectory is set, the jit/perf files
+    %% end up in the appropriate directory
+    TempDir = string:strip(os:cmd("mktemp -d"), right, $\n),
+    run_perfdirectory_test("+JPperfdirectory " ++ TempDir, TempDir).
+
+perfdirectory_not_set(_Config) ->
+    %% Confirm that when +JPperfdirectory is not set, the jit/perf files
+    %% end up in /tmp
+    run_perfdirectory_test("", "/tmp").
+
+run_perfdirectory_test(AdditionalFlags, ExpectedDirectory) ->
+    Cmd = "erl -noinput -eval 'io:format(\"~s~n\", [os:getpid()]).' -s init stop +JPperf true " ++ AdditionalFlags,
+    ThePid = string:strip(os:cmd(Cmd), right, $\n),
+    JitDumpFile = ExpectedDirectory ++ "/jit-" ++ ThePid ++ ".dump",
+    PerfMapFile = ExpectedDirectory ++ "/perf-" ++ ThePid ++ ".map",
+    case lists:all(fun filelib:is_file/1, [JitDumpFile, PerfMapFile]) of
+        true ->
+            ok;
+        _ ->
+            ct:fail("Expected ~s and ~s to exist", [JitDumpFile, PerfMapFile])
     end.

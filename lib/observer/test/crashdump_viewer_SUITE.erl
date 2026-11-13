@@ -1,7 +1,9 @@
 %%
 %% %CopyrightBegin%
 %%
-%% Copyright Ericsson AB 2003-2018. All Rights Reserved.
+%% SPDX-License-Identifier: Apache-2.0
+%%
+%% Copyright Ericsson AB 2003-2026. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -19,6 +21,8 @@
 %%
 
 -module(crashdump_viewer_SUITE).
+
+-compile([{nowarn_possibly_unsafe_function, {erlang, list_to_atom, 1}}]).
 
 -include_lib("observer/src/crashdump_viewer.hrl").
 
@@ -42,14 +46,27 @@
 init_per_testcase(start_stop, Config) ->
     catch crashdump_viewer:stop(),
     try
+        case os:getenv("ERL_CRASH_DUMP_PUBLIC_KEY") of
+             false ->
+                ok;
+             _ ->
+                exit("Crashdump viewer does not support encrypted crash dumps")
+        end,
 	case os:type() of
 	    {unix,darwin} ->
 		exit("Can not test on MacOSX");
+            {unix,sunos} ->
+                exit("Skip on sunos, for now");
 	    {unix, _} ->
-		io:format("DISPLAY ~s~n", [os:getenv("DISPLAY")]),
+                Display = os:getenv("DISPLAY"),
+		io:format("DISPLAY ~s~n", [Display]),
 		case ct:get_config(xserver, none) of
 		    none -> ignore;
-		    Server -> os:putenv("DISPLAY", Server)
+                    Display -> ok;
+		    Server ->
+                        os:putenv("DISPLAY", Server), %% Might work if new node is spawned
+                        io:format("Config sets other x-server than the DISPLAY\n"
+                                  "the DISPLAY variable must be set when starting erlang")
 		end;
 	    _ -> ignore
 	end,
@@ -180,7 +197,7 @@ start_stop(Config) when is_list(Config) ->
     ok.
 
 recv_downs([]) ->
-    ct:log("'DOWN' received from all registered proceses~n", []),
+    ct:log("'DOWN' received from all registered processes~n", []),
     ok;
 recv_downs(Regs) ->
     receive
@@ -357,7 +374,7 @@ browse_file(File) ->
     {ok,Mods,_ModsTW} = crashdump_viewer:loaded_modules(),
     {ok,_Mem,_MemTW} = crashdump_viewer:memory(),
     {ok,_AllocAreas,_AreaTW} = crashdump_viewer:allocated_areas(),
-    {ok,_AllocINfo,_AllocInfoTW} = crashdump_viewer:allocator_info(),
+    {ok,AllocInfo,_AllocInfoTW} = crashdump_viewer:allocator_info(),
     {ok,_HashTabs,_HashTabsTW} = crashdump_viewer:hash_tables(),
     {ok,_IndexTabs,_IndexTabsTW} = crashdump_viewer:index_tables(),
     {ok,_PTs,_PTsTW} = crashdump_viewer:persistent_terms(),
@@ -372,6 +389,9 @@ browse_file(File) ->
     io:format("  mods ok",[]),
     lookat_all_nodes(Nodes),
     io:format("  nodes ok",[]),
+
+    lookat_alloc_info(AllocInfo,is_truncated(File)),
+    io:format("  alloc info ok",[]),
 
     Procs. % used as second arg to special/2
 
@@ -725,6 +745,32 @@ lookat_all_nodes([#nod{channel=Channel0}|Nodes]) ->
     Channel = integer_to_list(Channel0),
     {ok,_Node=#nod{},_NodeTW} = crashdump_viewer:node_info(Channel),
     lookat_all_nodes(Nodes).
+
+lookat_alloc_info(_,true) ->
+    ok;
+lookat_alloc_info([AllocSummary|_],false) ->
+    {"Allocator Summary",
+     ["blocks size", "carriers size", "mseg carriers size"],
+     Data
+    } = AllocSummary,
+
+    %% All values must be integer.
+    Filter = filter_alloc_info_fun(),
+    _ = [list_to_integer(IntStr) || {_,L} <- Data,
+                                    IntStr <- Filter(L)],
+
+    ok.
+
+filter_alloc_info_fun() ->
+    case os:type() of
+        {win32,_} ->
+            fun([A,B,_]) ->
+                    %% The third column is never valid on Windows.
+                    [A,B]
+            end;
+        _ ->
+            fun([_,_,_]=L) -> L end
+    end.
 
 %%%-----------------------------------------------------------------
 %%% 

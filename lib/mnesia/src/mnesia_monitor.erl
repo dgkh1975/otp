@@ -1,7 +1,9 @@
 %%
 %% %CopyrightBegin%
 %%
-%% Copyright Ericsson AB 1996-2020. All Rights Reserved.
+%% SPDX-License-Identifier: Apache-2.0
+%%
+%% Copyright Ericsson AB 1996-2025. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -20,6 +22,9 @@
 
 %%
 -module(mnesia_monitor).
+-moduledoc false.
+
+-compile([{nowarn_deprecated_function, [{erlang,exit,2}]}]).
 
 -behaviour(gen_server).
 
@@ -83,9 +88,9 @@
 		going_down = [], tm_started = false, early_connects = [],
 		connecting, mq = [], remote_node_status = []}).
 
--define(current_protocol_version,  {8,5}).
+-define(current_protocol_version,  {8,6}).
 
--define(previous_protocol_version, {8,4}).
+-define(previous_protocol_version, {8,5}).
 
 start() ->
     gen_server:start_link({local, ?MODULE}, ?MODULE,
@@ -196,7 +201,7 @@ protocol_version() ->
 %% A sorted list of acceptable protocols the
 %% preferred protocols are first in the list
 acceptable_protocol_versions() ->
-    [protocol_version(), ?previous_protocol_version, {8,3}].
+    [protocol_version(), ?previous_protocol_version, {8,4}, {8,3}].
 
 needs_protocol_conversion(Node) ->
     case {?catch_val({protocol, Node}), protocol_version()} of
@@ -313,8 +318,8 @@ use_dir() ->
 %% Returns true if the Mnesia directory contains
 %% important files
 non_empty_dir() ->
-    mnesia_lib:exists(mnesia_bup:fallback_bup()) or
-    mnesia_lib:exists(mnesia_lib:tab2dmp(schema)) or
+    mnesia_lib:exists(mnesia_bup:fallback_bup()) orelse
+    mnesia_lib:exists(mnesia_lib:tab2dmp(schema)) orelse
     mnesia_lib:exists(mnesia_lib:tab2dat(schema)).
 
 %%----------------------------------------------------------------------

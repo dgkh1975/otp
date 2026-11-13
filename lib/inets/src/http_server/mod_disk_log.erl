@@ -1,8 +1,10 @@
 %%
 %% %CopyrightBegin%
-%% 
-%% Copyright Ericsson AB 1997-2021. All Rights Reserved.
-%% 
+%%
+%% SPDX-License-Identifier: Apache-2.0
+%%
+%% Copyright Ericsson AB 1997-2025. All Rights Reserved.
+%%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
 %% You may obtain a copy of the License at
@@ -14,11 +16,12 @@
 %% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 %% See the License for the specific language governing permissions and
 %% limitations under the License.
-%% 
+%%
 %% %CopyrightEnd%
 %%
 %%
 -module(mod_disk_log).
+-moduledoc false.
 
 %% Application internal API
 -export([error_log/2, report_error/2, security_log/2]).
@@ -240,7 +243,7 @@ create_disk_log(LogFile, SizeTag, ConfigList) ->
 		undefined ->
 		    {error,
 		     ?NICE(Filename++
-			   " is an invalid ErrorLog beacuse ServerRoot "
+			   " is an invalid ErrorLog because ServerRoot "
 			   "is not defined")};
 		ServerRoot ->
 		    AbsoluteFilename = filename:join(ServerRoot,Filename),
@@ -263,7 +266,7 @@ create_disk_log(Filename, MaxBytes, MaxFiles, ConfigList) ->
 %%
 %% When the internal disk log format is used, we will do some extra 
 %% controls. If the files are valid, try to repair them and if 
-%% thats not possible, truncate.
+%% that's not possible, truncate.
 %%----------------------------------------------------------------------
 
 open(Filename, MaxBytes, MaxFiles, internal) ->
